@@ -707,14 +707,35 @@ async function executeMainAgentPrompt(opts: {
       if (errStr.toLowerCase().includes("abort")) {
         return "🛑 已停止当前主脑响应。";
       }
-      const errMsg = `⚠️ 主脑调用异常: ${errStr}`;
+      const errMsg = `⚠️ 主脑调用异常 (\`${mainModelCfg.providerID}/${mainModelCfg.modelID}\`): ${errStr}`;
       if (opts.sendReply) await opts.sendReply(errMsg);
       return errMsg;
     }
 
-    const replyText = extractReplyText(res.data?.parts as any[]) || "（已完成编排操作，等待子分支最终汇报）";
-    if (opts.sendReply) await opts.sendReply(replyText);
-    return replyText;
+    const infoErr = (res.data as any)?.info?.error;
+    if (infoErr) {
+      const rawErrMsg = infoErr?.data?.message || infoErr?.message || JSON.stringify(infoErr);
+      if (String(rawErrMsg).toLowerCase().includes("abort")) {
+        return "🛑 已停止当前主脑响应。";
+      }
+      const errMsg = `⚠️ 主脑模型响应被拦截或异常 (\`${mainModelCfg.providerID}/${mainModelCfg.modelID}\`):\n\`\`\`\n${rawErrMsg}\n\`\`\``;
+      if (opts.sendReply) await opts.sendReply(errMsg);
+      return errMsg;
+    }
+
+    const parts = (res.data?.parts as any[]) || [];
+    const replyText = extractReplyText(parts);
+    if (replyText) {
+      if (opts.sendReply) await opts.sendReply(replyText);
+      return replyText;
+    }
+
+    const hasToolCall = parts.some((p: any) => p?.type === "tool");
+    const fallbackMsg = hasToolCall
+      ? "（已完成编排操作，等待子分支最终汇报）"
+      : `⚠️ 模型 (\`${mainModelCfg.providerID}/${mainModelCfg.modelID}\`) 返回了空响应（可能被上游安全策略过滤）。`;
+    if (opts.sendReply) await opts.sendReply(fallbackMsg);
+    return fallbackMsg;
   } finally {
     turnDone = true;
     clearInterval(heartbeatTimer);
