@@ -62,6 +62,15 @@ export const PurpleLightPlugin: Plugin = async ({ client }) => {
       const scout = getScoutBySession(input.sessionID);
       if (!scout) return;
 
+      if (scout.status === "stopped" || scout.status === "timeout") {
+        throw new Error(`[SCOUT_TERMINATED] 当前子分支 (${scout.scout_id}) 状态为 ${scout.status}，已停止执行。`);
+      }
+
+      if (scout.deadline_at && Date.now() > Number(scout.deadline_at)) {
+        db.prepare(`UPDATE scouts SET status = 'timeout', updated_at = CURRENT_TIMESTAMP WHERE scout_id = ?`).run(scout.scout_id);
+        throw new Error(`[SCOUT_TIMEOUT] 当前子分支 (${scout.scout_id}) 已超过设定的超时时间 (${scout.timeout_sec}s)，请立即停止操作。`);
+      }
+
       const settlementTools = new Set(["record_fact", "report_finding", "submit_scout_report", "graph_overview"]);
 
       // 1. Increment step count and check turn budget (default 80, extendable via extend_scout)
@@ -120,13 +129,14 @@ export const PurpleLightPlugin: Plugin = async ({ client }) => {
             .replace(/IMPORTANT: Keep your responses short[\s\S]*?demonstrate appropriate verbosity:/g, "")
             .replace(/You MUST answer concisely with fewer than 4 lines[^\n]*/g, "");
         }
+        const remainSec = scout.deadline_at ? Math.max(0, Math.round((Number(scout.deadline_at) - Date.now()) / 1000)) : scout.timeout_sec;
         output.system.push(
           `\n# PurpleLight (紫电) 子分支运行契约 (${scout.scout_id})\n` +
           `- 身份: 紫电 (PurpleLight) 系统的执行子 Agent (${scout.scout_id}, role: ${scout.role})\n` +
           `- 专属工作区: ${scout.workspace_dir} (所有脚本、临时文件、下载产物请写在此目录内；修改目录外文件会触发 Hook 拦截审批)\n` +
-          `- 轮数预算: 已用 ${scout.steps_used} / 上限 ${scout.max_steps} 步 (若预算不足，结案时可将 suggest_more_turns 设为 true 请求追加轮数)\n` +
+          `- 预算约束: 轮数已用 ${scout.steps_used}/${scout.max_steps} 步 | 剩余超时时间约 ${remainSec}s (执行 curl/网络请求时务必加上 --max-time 或 timeout 以防单步永久阻塞)\n` +
           `- 如需提取 B 站视频字幕或评论情报，请先调用 skill(name="bilibili-intel") 或执行 python3 ${BILI_SCRIPT_PATH}。\n` +
-          `- 关键验证结论（肯定或证伪）请调用 record_fact；确认漏洞请调用 report_finding；完成任务或轮数耗尽时，必须调用 submit_scout_report 提交完整最终报告（你的中间工具调用不会打扰主聊天，只有 submit_scout_report 的最终报告会展示给用户和主会话）。`
+          `- 关键验证结论（肯定或证伪）请调用 record_fact；确认漏洞请调用 report_finding；完成任务或轮数耗尽时，必须调用 submit_scout_report 提交完整最终报告（提交后会自动回调唤醒主 Agent）。`
         );
       } else {
         // Clear OpenCode's default CLI system prompt ("fewer than 4 lines / One word answers are best")
@@ -138,14 +148,15 @@ export const PurpleLightPlugin: Plugin = async ({ client }) => {
           `- 日常技术交流、攻击面梳理与思路讨论直接自然回答即可，根据问题本身决定详略。\n` +
           `- 需要执行具体动作（读取外部网页/HackerOne 报告、用 Skill 提取 B 站视频情报、审计代码、编写并运行验证脚本）时，通过以下编排原语交由子 Agent 完成：\n` +
           `  - \`add_intent\`: 在探索图黑板登记探索意图或漏洞假设\n` +
-          `  - \`fork_scout\`: 从当前主会话分叉 (Fork) 出继承完整上下文的 Scout 子 Agent，分配独立工作区与默认 80 轮预算在后台静默执行（子分支中间过程不打扰主聊天，完成后自动向主会话和用户提交最终报告）\n` +
+          `  - \`fork_scout\`: 从当前主会话分叉 (Fork) 出继承完整上下文的 Scout 子 Agent，支持设置 \`max_steps\` (默认 80 轮) 与 \`timeout_sec\` (默认 600 秒) 在后台静默执行；当 Scout 正常结案、超时或耗尽轮数时，系统会自动回调唤醒你进行下一步决策\n` +
+          `  - \`stop_scout\`: 强制终止指定正在运行或卡住的 Scout 子分支\n` +
           `  - \`send_hint\`: 向单个指定 Scout 定向单播发送新线索（静默注入，不影响其他分支）\n` +
           `  - \`broadcast_hint\`: 向所有活跃 Scout 全局广播线索\n` +
-          `  - \`extend_scout\`: 为指定 Scout 动态追加轮数上限并唤醒继续探索\n` +
-          `  - \`clean_workspaces\`: 清理指定 Scout 或当前会话下已结束的 Scout 工作区目录\n` +
-          `  - \`list_scouts\` / \`get_scout_detail\` / \`graph_overview\`: 查看子分支状态、完整报告与探索图黑板（intents / facts / findings / hints）\n\n` +
+          `  - \`extend_scout\`: 为指定 Scout 动态追加轮数上限与超时时间，并唤醒继续探索\n` +
+          `  - \`get_scout_detail\`: 查看指定 Scout 的完整报告、工作区文件、Facts，以及**最后 N 轮的消息与工具调用入参**（不含工具返回结果，专用于诊断 Scout 进展或卡死/失败原因）\n` +
+          `  - \`list_scouts\` / \`graph_overview\` / \`clean_workspaces\`: 查看分支列表、黑板全貌或清理工作区\n\n` +
           `## 飞书快捷指令（仅在用户询问用法时提示）\n` +
-          `\`/status\`、\`/scouts\`、\`/report <scout-id>\`、\`/hint <scout-id> <内容>\`、\`/broadcast <内容>\`、\`/extend <scout-id> <轮数>\`、\`/clean [scout-id|all]\`、\`/provider\`、\`/model\`、\`/approve <id>\`、\`/deny <id>\`、\`/new\`、\`/help\``
+          `\`/status\`、\`/scouts\`、\`/stop [scout-id|all]\`、\`/report <scout-id>\`、\`/hint <scout-id> <内容>\`、\`/broadcast <内容>\`、\`/extend <scout-id> <轮数> [秒数]\`、\`/clean [scout-id|all]\`、\`/provider\`、\`/model\`、\`/approve <id>\`、\`/deny <id>\`、\`/new\`、\`/help\``
         );
       }
     },
@@ -264,16 +275,19 @@ export const PurpleLightPlugin: Plugin = async ({ client }) => {
       }),
 
       fork_scout: tool({
-        description: "从当前主会话一键分叉 (Fork) 出一个继承全部对话上下文的 Scout 子 Agent，分配独立工作区文件夹并在后台静默执行任务（完成后推送最终报告）",
+        description: "从当前主会话一键分叉 (Fork) 出一个继承全部对话上下文的 Scout 子 Agent，分配独立工作区文件夹、最大轮数 (max_steps) 与超时时间 (timeout_sec) 在后台静默执行；结束或超时后会自动回调激活主 Agent",
         args: {
           goal: tool.schema.string().describe("指派给该 Scout 子 Agent 的具体任务目标与要求"),
           intent_id: tool.schema.number().optional().describe("关联的探索图 intent_id（如果不传则自动创建一个对应 Intent）"),
           max_steps: tool.schema.number().optional().describe("最大执行轮数上限，默认 80 轮"),
+          timeout_sec: tool.schema.number().optional().describe("最大超时时间（秒），默认 600 秒（10分钟）；超时后自动中断并回调激活主 Agent"),
           model: tool.schema.string().optional().describe("子 Agent 模型，默认使用当前配置的 scout 模型")
         },
         async execute(args, ctx) {
           const mainId = resolveMainSessionId(ctx.sessionID);
           const maxSteps = args.max_steps ?? 80;
+          const timeoutSec = Math.max(5, args.timeout_sec ?? 600);
+          const deadlineAt = Date.now() + timeoutSec * 1000;
           const configuredScoutModel = getAgentModelConfig("scout");
           let providerID = configuredScoutModel.providerID;
           let modelID = configuredScoutModel.modelID;
@@ -321,9 +335,24 @@ export const PurpleLightPlugin: Plugin = async ({ client }) => {
           const originUserMsgId = chatBinding?.last_user_msg_id || null;
 
           db.prepare(`
-            INSERT OR REPLACE INTO scouts (scout_id, session_id, parent_session_id, intent_id, role, goal, workspace_dir, model, status, steps_used, max_steps, feishu_thread_msg_id)
-            VALUES (?, ?, ?, ?, 'scout', ?, ?, ?, 'running', 0, ?, ?)
-          `).run(scoutId, forkedSessionId, mainId, intentId, args.goal, workspaceDir, `${providerID}/${modelID}`, maxSteps, originUserMsgId);
+            INSERT OR REPLACE INTO scouts (
+              scout_id, session_id, parent_session_id, intent_id, role, goal, workspace_dir, model,
+              status, steps_used, max_steps, timeout_sec, deadline_at, callback_sent, feishu_thread_msg_id
+            )
+            VALUES (?, ?, ?, ?, 'scout', ?, ?, ?, 'running', 0, ?, ?, ?, 0, ?)
+          `).run(
+            scoutId,
+            forkedSessionId,
+            mainId,
+            intentId,
+            args.goal,
+            workspaceDir,
+            `${providerID}/${modelID}`,
+            maxSteps,
+            timeoutSec,
+            deadlineAt,
+            originUserMsgId
+          );
 
           db.prepare(`UPDATE intents SET scout_id = ? WHERE id = ?`).run(scoutId, intentId);
 
@@ -331,7 +360,7 @@ export const PurpleLightPlugin: Plugin = async ({ client }) => {
             `🎯 [子 Agent 专项任务指派 — ${scoutId}]\n` +
             `- 关联 Intent ID: ${intentId}\n` +
             `- 专属工作目录: ${workspaceDir} (所有临时文件、脚本、下载内容必须保存在该目录下)\n` +
-            `- 轮数预算上限: ${maxSteps} 步\n` +
+            `- 轮数预算上限: ${maxSteps} 步 | 超时上限: ${timeoutSec} 秒\n` +
             `- 你的具体任务目标:\n${args.goal}\n\n` +
             `请结合你继承的前序主会话上下文立即开始执行。过程中发现的关键事实请调用 record_fact，任务完成时请务必调用 submit_scout_report 提交完整最终报告！`;
 
@@ -352,7 +381,43 @@ export const PurpleLightPlugin: Plugin = async ({ client }) => {
             intent_id: intentId,
             workspace_dir: workspaceDir,
             max_steps: maxSteps,
+            timeout_sec: timeoutSec,
             model: `${providerID}/${modelID}`
+          });
+        }
+      }),
+
+      stop_scout: tool({
+        description: "强制终止指定正在运行或卡住的 Scout 子分支 (调用底层 session.abort 掐断模型流与正在执行的 bash 工具)",
+        args: {
+          scout_id: tool.schema.string().describe("目标子 Agent ID，例如 scout-1"),
+          reason: tool.schema.string().optional().describe("终止原因说明（可选）")
+        },
+        async execute(args) {
+          const scout = getScoutById(args.scout_id);
+          if (!scout) {
+            throw new Error(`Scout not found: ${args.scout_id}`);
+          }
+          await client.session.abort({
+            path: { id: scout.session_id }
+          }).catch(() => {});
+
+          const summaryNote = args.reason ? `由主脑主动终止: ${args.reason}` : "由主脑主动终止 (stopped)";
+          db.prepare(`
+            UPDATE scouts
+            SET status = 'stopped', callback_sent = 1, report_summary = COALESCE(NULLIF(report_summary, ''), ?), updated_at = CURRENT_TIMESTAMP
+            WHERE scout_id = ?
+          `).run(summaryNote, scout.scout_id);
+
+          if (scout.intent_id) {
+            db.prepare(`UPDATE intents SET status = 'stopped' WHERE id = ?`).run(scout.intent_id);
+          }
+
+          return JSON.stringify({
+            status: "stopped",
+            scout_id: scout.scout_id,
+            steps_used: scout.steps_used,
+            reason: summaryNote
           });
         }
       }),
@@ -423,10 +488,11 @@ export const PurpleLightPlugin: Plugin = async ({ client }) => {
       }),
 
       extend_scout: tool({
-        description: "动态为某个子 Agent (scout_id) 追加执行轮数上限（例如 +40 轮），并唤醒它基于原有上下文继续深度探索",
+        description: "动态为某个子 Agent (scout_id) 追加执行轮数上限与超时时间，并唤醒它基于原有上下文继续深度探索",
         args: {
           scout_id: tool.schema.string().describe("目标子 Agent ID，例如 scout-1"),
           add_turns: tool.schema.number().describe("要追加的轮数，例如 40 或 80"),
+          timeout_sec: tool.schema.number().optional().describe("重置后的超时时间（秒），默认继承该分支原 timeout_sec（或 600 秒）"),
           instruction: tool.schema.string().optional().describe("追加轮数同时附带的进一步探索指令（可选）")
         },
         async execute(args) {
@@ -438,10 +504,18 @@ export const PurpleLightPlugin: Plugin = async ({ client }) => {
             mkdirSync(scout.workspace_dir, { recursive: true });
           }
           const newMaxSteps = (scout.max_steps || 80) + args.add_turns;
+          const timeoutSec = Math.max(5, args.timeout_sec ?? scout.timeout_sec ?? 600);
+          const newDeadlineAt = Date.now() + timeoutSec * 1000;
+
           db.prepare(`
-            UPDATE scouts SET max_steps = ?, status = 'running', suggest_more_turns = 0, updated_at = CURRENT_TIMESTAMP
+            UPDATE scouts
+            SET max_steps = ?, timeout_sec = ?, deadline_at = ?, callback_sent = 0, status = 'running', suggest_more_turns = 0, updated_at = CURRENT_TIMESTAMP
             WHERE scout_id = ?
-          `).run(newMaxSteps, scout.scout_id);
+          `).run(newMaxSteps, timeoutSec, newDeadlineAt, scout.scout_id);
+
+          if (scout.intent_id) {
+            db.prepare(`UPDATE intents SET status = 'running' WHERE id = ?`).run(scout.intent_id);
+          }
 
           const configuredScout = getAgentModelConfig("scout");
           let providerID = configuredScout.providerID;
@@ -452,8 +526,8 @@ export const PurpleLightPlugin: Plugin = async ({ client }) => {
             modelID = scout.model.slice(idx + 1);
           }
           const resumeText =
-            `🔋 [主会话已为你追加轮数预算]\n` +
-            `- 新增轮数: +${args.add_turns} 步 (当前已用 ${scout.steps_used} 步 / 新上限 ${newMaxSteps} 步)\n` +
+            `🔋 [主会话已为你追加预算与超时时间]\n` +
+            `- 新增轮数: +${args.add_turns} 步 (当前已用 ${scout.steps_used} 步 / 新上限 ${newMaxSteps} 步) | 新超时窗口: ${timeoutSec}s\n` +
             (args.instruction ? `- 主脑最新指示: ${args.instruction}\n` : `- 请接着刚才的进度继续深入探索，无需重复已完成的工作。\n`) +
             `完成后请再次调用 submit_scout_report 提交完整报告。`;
 
@@ -471,18 +545,19 @@ export const PurpleLightPlugin: Plugin = async ({ client }) => {
             status: "extended_and_resumed",
             scout_id: scout.scout_id,
             steps_used: scout.steps_used,
-            new_max_steps: newMaxSteps
+            new_max_steps: newMaxSteps,
+            timeout_sec: timeoutSec
           });
         }
       }),
 
       list_scouts: tool({
-        description: "列出当前主会话分叉出的所有 Scout 子 Agent 及其状态、轮数消耗、工作区目录与汇报摘要",
+        description: "列出当前主会话分叉出的所有 Scout 子 Agent 及其状态、轮数消耗、超时设置、工作区目录与汇报摘要",
         args: {},
         async execute(_args, ctx) {
           const mainId = resolveMainSessionId(ctx.sessionID);
           const scouts = db.prepare(`
-            SELECT scout_id, session_id, intent_id, role, goal, workspace_dir, model, status, steps_used, max_steps, report_summary, suggest_more_turns, created_at, updated_at
+            SELECT scout_id, session_id, intent_id, role, goal, workspace_dir, model, status, steps_used, max_steps, timeout_sec, deadline_at, report_summary, suggest_more_turns, created_at, updated_at
             FROM scouts WHERE parent_session_id = ? ORDER BY created_at DESC
           `).all(mainId);
           return JSON.stringify(scouts, null, 2);
@@ -490,9 +565,10 @@ export const PurpleLightPlugin: Plugin = async ({ client }) => {
       }),
 
       get_scout_detail: tool({
-        description: "获取指定 Scout 子 Agent 的完整不限字数详细报告 (report_detail)、工作区文件列表以及已记录的 Facts",
+        description: "获取指定 Scout 子 Agent 的完整详细报告、工作区文件列表、已记录 Facts，以及最后 N 轮的消息与工具调用入参（不含工具返回结果，便于诊断卡死或失败原因）",
         args: {
-          scout_id: tool.schema.string().describe("目标子 Agent ID，例如 scout-1")
+          scout_id: tool.schema.string().describe("目标子 Agent ID，例如 scout-1"),
+          tail_turns: tool.schema.number().optional().describe("要提取的最后几轮助手消息与工具调用入参轮数，默认 5")
         },
         async execute(args) {
           const scout = getScoutById(args.scout_id);
@@ -503,7 +579,60 @@ export const PurpleLightPlugin: Plugin = async ({ client }) => {
           } catch {}
           const facts = db.prepare(`SELECT * FROM facts WHERE scout_id = ? ORDER BY id DESC`).all(scout.scout_id);
           const findings = db.prepare(`SELECT * FROM findings WHERE scout_id = ? ORDER BY id DESC`).all(scout.scout_id);
-          return JSON.stringify({ scout, workspace_files: files, facts, findings }, null, 2);
+
+          // Extract last N assistant turns (messages + tool call input arguments ONLY, stripping tool outputs & reasoning)
+          const tailCount = Math.max(1, Math.min(20, args.tail_turns ?? 5));
+          let recentActivity: any[] = [];
+          try {
+            const msgRes = await client.session.messages({
+              path: { id: scout.session_id }
+            });
+            const allMsgs = Array.isArray(msgRes.data) ? msgRes.data : [];
+            const assistantMsgs = allMsgs.filter((m: any) => m?.info?.role === "assistant");
+            const sliced = assistantMsgs.slice(-tailCount);
+            recentActivity = sliced.map((m: any, idx: number) => {
+              const turnNumber = assistantMsgs.length - sliced.length + idx + 1;
+              const texts: string[] = [];
+              const toolCalls: any[] = [];
+              for (const part of m.parts || []) {
+                if (part?.type === "text" && part.text?.trim()) {
+                  texts.push(part.text.trim());
+                } else if (part?.type === "tool") {
+                  const st = part.state || {};
+                  const callEntry: Record<string, any> = {
+                    tool: part.tool,
+                    status: st.status || "unknown",
+                    input: st.input ?? {}
+                  };
+                  if (st.status === "error" && st.error) {
+                    callEntry.error = String(st.error).slice(0, 500);
+                  }
+                  if (st.time) {
+                    callEntry.time = st.time;
+                  }
+                  toolCalls.push(callEntry);
+                }
+              }
+              return {
+                assistant_turn: turnNumber,
+                message_id: m.info?.id,
+                created_at: m.info?.time?.created ? new Date(m.info.time.created).toISOString() : undefined,
+                ...(m.info?.error ? { message_error: m.info.error } : {}),
+                ...(texts.length > 0 ? { assistant_text: texts.join("\n") } : {}),
+                tool_calls: toolCalls
+              };
+            });
+          } catch (e: any) {
+            recentActivity = [{ warning: `Failed to fetch session messages: ${e?.message || String(e)}` }];
+          }
+
+          return JSON.stringify({
+            scout,
+            workspace_files: files,
+            recent_activity: recentActivity,
+            facts,
+            findings
+          }, null, 2);
         }
       }),
 
@@ -530,7 +659,7 @@ export const PurpleLightPlugin: Plugin = async ({ client }) => {
       }),
 
       submit_scout_report: tool({
-        description: "【Scout 专用最终汇报工具】当 Scout 完成指派的任务（或达到轮数上限收尾）时调用，将完整详尽的最终报告（不限字数）回流给主会话并推送到飞书",
+        description: "【Scout 专用最终汇报工具】当 Scout 完成指派的任务（或达到轮数上限收尾）时调用，将完整详尽的最终报告（不限字数）推送到飞书并自动回调激活主 Agent",
         args: {
           summary: tool.schema.string().describe("核心结论摘要（1-3句话，便于主会话快速索引）"),
           detail: tool.schema.string().describe("完整详尽的调查报告正文（不限长度！可包含完整代码调用链分析、B站视频/外部报告关键情报提炼、PoC 输出结果、实验数据等）"),
@@ -545,7 +674,7 @@ export const PurpleLightPlugin: Plugin = async ({ client }) => {
           const newStatus = args.suggest_more_turns ? "exhausted" : "completed";
           db.prepare(`
             UPDATE scouts
-            SET status = ?, report_summary = ?, report_detail = ?, suggest_more_turns = ?, suggested_next_steps = ?, updated_at = CURRENT_TIMESTAMP
+            SET status = ?, callback_sent = 1, report_summary = ?, report_detail = ?, suggest_more_turns = ?, suggested_next_steps = ?, updated_at = CURRENT_TIMESTAMP
             WHERE scout_id = ?
           `).run(
             newStatus,
@@ -563,23 +692,9 @@ export const PurpleLightPlugin: Plugin = async ({ client }) => {
             );
           }
 
-          const mergeReportText =
-            `📥 [子 Agent 最终回流报告 — ${scout.scout_id}] (状态: ${newStatus}, 消耗轮数: ${scout.steps_used}/${scout.max_steps})\n` +
-            `- 原始任务: ${scout.goal}\n` +
-            `- 核心摘要: ${args.summary}\n` +
-            (args.suggest_more_turns ? `- ⚠️ 请求追加轮数: 是 (建议下一步: ${args.suggested_next_steps || "继续深入"})\n` : "") +
-            `- 详细报告正文:\n${args.detail}`;
-
-          await client.session.prompt({
-            path: { id: scout.parent_session_id },
-            body: {
-              noReply: true,
-              parts: [{ type: "text", text: mergeReportText }]
-            }
-          }).catch(() => {});
-
           pushOutboxEvent(scout.parent_session_id, scout.scout_id, "scout_report_submitted", {
             scout_id: scout.scout_id,
+            goal: scout.goal,
             status: newStatus,
             steps_used: scout.steps_used,
             max_steps: scout.max_steps,
@@ -590,7 +705,7 @@ export const PurpleLightPlugin: Plugin = async ({ client }) => {
           });
 
           return JSON.stringify({
-            status: "report_merged_to_main",
+            status: "report_submitted_and_main_agent_callback_queued",
             scout_id: scout.scout_id,
             scout_status: newStatus
           });

@@ -2,7 +2,16 @@ import { createOpencodeClient } from "@opencode-ai/sdk";
 import * as Lark from "@larksuiteoapi/node-sdk";
 import { existsSync, mkdirSync, readFileSync, writeFileSync, readdirSync } from "fs";
 import { basename, join } from "path";
-import { PROJECT_ROOT, db, getGraphOverview, getAgentModelConfig, setAgentModelConfig, cleanScoutWorkspaces, resetBlackboardForNewSession } from "./db";
+import {
+  PROJECT_ROOT,
+  db,
+  getGraphOverview,
+  getAgentModelConfig,
+  setAgentModelConfig,
+  cleanScoutWorkspaces,
+  resetBlackboardForNewSession,
+  pushOutboxEvent
+} from "./db";
 
 const OPENCODE_URL = process.env.OPENCODE_URL || "http://127.0.0.1:4096";
 const opencode = createOpencodeClient({ baseUrl: OPENCODE_URL });
@@ -353,6 +362,7 @@ async function removeReaction(messageId: string, reactionId?: string): Promise<v
 interface SessionLiveState {
   sessionId: string;
   startedAt: number;
+  lastEventAt: number;
   iteration: number;
   maxIterations: number;
   activity: string;
@@ -373,6 +383,7 @@ function getOrInitSessionState(sessionId: string, maxIterations = MAIN_MAX_ITERA
     st = {
       sessionId,
       startedAt: Date.now(),
+      lastEventAt: Date.now(),
       iteration: 0,
       maxIterations,
       activity: "waiting for provider response (streaming)",
@@ -392,6 +403,7 @@ function resetSessionTurnState(sessionId: string, maxIterations = MAIN_MAX_ITERA
   const st: SessionLiveState = {
     sessionId,
     startedAt: Date.now(),
+    lastEventAt: Date.now(),
     iteration: 0,
     maxIterations,
     activity: "waiting for provider response (streaming)",
@@ -426,6 +438,7 @@ const TOOL_EMOJIS: Record<string, string> = {
   graph_overview: "📊",
   add_intent: "🎯",
   fork_scout: "🚀",
+  stop_scout: "🛑",
   send_hint: "⚡",
   broadcast_hint: "📡",
   extend_scout: "🔋",
@@ -469,6 +482,8 @@ export function formatToolProgressBubble(toolName: string, args: Record<string, 
     preview = oneLineTrunc(args.title || args.detail || "");
   } else if (toolName === "fork_scout") {
     preview = oneLineTrunc(args.goal || "");
+  } else if (toolName === "stop_scout") {
+    preview = `${args.scout_id || ""} ${oneLineTrunc(args.reason || "", 40)}`.trim();
   } else if (toolName === "send_hint") {
     preview = `${args.scout_id || ""}: ${oneLineTrunc(args.hint || "", 50)}`.trim();
   } else if (toolName === "broadcast_hint") {
@@ -528,6 +543,7 @@ function startOpencodeEventStream() {
           const maxIter = scoutRow?.max_steps || MAIN_MAX_ITERATIONS;
           const st = getOrInitSessionState(sid, maxIter);
           st.maxIterations = maxIter;
+          st.lastEventAt = Date.now();
 
           if (ev.type === "session.status") {
             const statusType = props.status?.type;
@@ -597,6 +613,116 @@ export function buildWorkingHeartbeatText(opts: {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Per-Main-Session Serializing Turn Queue & Main Agent Prompt Runner
+// Ensures user messages and Scout completion/timeout callbacks never collide!
+// ─────────────────────────────────────────────────────────────────────────────
+
+const mainTurnQueues = new Map<string, Promise<any>>();
+const mainTurnEpoch = new Map<string, number>();
+
+function getSessionEpoch(mainSessionId: string): number {
+  return mainTurnEpoch.get(mainSessionId) || 0;
+}
+
+function bumpSessionEpoch(mainSessionId: string): number {
+  const next = getSessionEpoch(mainSessionId) + 1;
+  mainTurnEpoch.set(mainSessionId, next);
+  return next;
+}
+
+function enqueueMainAgentTurn<T>(mainSessionId: string, task: (epochAtEnqueue: number) => Promise<T>): Promise<T> {
+  const epochAtEnqueue = getSessionEpoch(mainSessionId);
+  const prev = mainTurnQueues.get(mainSessionId) || Promise.resolve();
+  const next = prev
+    .catch(() => {})
+    .then(() => task(epochAtEnqueue));
+  mainTurnQueues.set(mainSessionId, next);
+  return next;
+}
+
+function extractReplyText(parts: any[] = []): string {
+  const texts: string[] = [];
+  for (const p of parts) {
+    if (p.type === "text" && p.text?.trim()) {
+      texts.push(p.text.trim());
+    }
+  }
+  return texts.join("\n\n").trim();
+}
+
+async function executeMainAgentPrompt(opts: {
+  chatId: string;
+  mainSessionId: string;
+  promptText: string;
+  replyToMsgId?: string;
+  sendReply?: (msg: string) => Promise<string | undefined>;
+  epochAtEnqueue: number;
+}): Promise<string> {
+  if (getSessionEpoch(opts.mainSessionId) !== opts.epochAtEnqueue) {
+    return "🛑 任务已被取消。";
+  }
+
+  const mainModelCfg = getAgentModelConfig("main");
+  const turnState = resetSessionTurnState(opts.mainSessionId, MAIN_MAX_ITERATIONS);
+  if (opts.replyToMsgId) {
+    activeMainTurnReplyMsgId.set(opts.mainSessionId, opts.replyToMsgId);
+  }
+
+  let turnDone = false;
+  let heartbeatMsgId: string | undefined;
+  const heartbeatTimer = setInterval(async () => {
+    if (turnDone || !opts.chatId.startsWith("oc_")) return;
+    const elapsedMs = Date.now() - turnState.startedAt;
+    if (elapsedMs < WORKING_HEARTBEAT_MS) return;
+    const hbText = buildWorkingHeartbeatText({
+      elapsedMs,
+      iteration: turnState.iteration || 1,
+      maxIterations: MAIN_MAX_ITERATIONS,
+      activity: turnState.activity || "waiting for provider response (streaming)"
+    });
+    if (heartbeatMsgId) {
+      const ok = await editFeishuMessage(heartbeatMsgId, hbText);
+      if (ok) return;
+    }
+    heartbeatMsgId = await sendFeishuMessage(opts.chatId, hbText, { replyToMsgId: opts.replyToMsgId });
+  }, WORKING_HEARTBEAT_MS);
+
+  try {
+    const res = await opencode.session.prompt({
+      path: { id: opts.mainSessionId },
+      body: {
+        agent: "strategist",
+        variant: "max",
+        model: { providerID: mainModelCfg.providerID, modelID: mainModelCfg.modelID },
+        parts: [{ type: "text", text: opts.promptText }]
+      } as any
+    });
+
+    if (getSessionEpoch(opts.mainSessionId) !== opts.epochAtEnqueue) {
+      return "🛑 已停止当前主脑响应。";
+    }
+
+    if (res.error) {
+      const errStr = JSON.stringify(res.error);
+      if (errStr.toLowerCase().includes("abort")) {
+        return "🛑 已停止当前主脑响应。";
+      }
+      const errMsg = `⚠️ 主脑调用异常: ${errStr}`;
+      if (opts.sendReply) await opts.sendReply(errMsg);
+      return errMsg;
+    }
+
+    const replyText = extractReplyText(res.data?.parts as any[]) || "（已完成编排操作，等待子分支最终汇报）";
+    if (opts.sendReply) await opts.sendReply(replyText);
+    return replyText;
+  } finally {
+    turnDone = true;
+    clearInterval(heartbeatTimer);
+    activeMainTurnReplyMsgId.delete(opts.mainSessionId);
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Conversation & Slash Command Router
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -620,16 +746,6 @@ async function getOrCreateMainSession(chatId: string, userMsgId?: string): Promi
     VALUES (?, ?, ?, CURRENT_TIMESTAMP)
   `).run(chatId, created.data.id, userMsgId || null);
   return created.data.id;
-}
-
-function extractReplyText(parts: any[] = []): string {
-  const texts: string[] = [];
-  for (const p of parts) {
-    if (p.type === "text" && p.text?.trim()) {
-      texts.push(p.text.trim());
-    }
-  }
-  return texts.join("\n\n").trim() || "（已完成编排操作，等待子分支最终汇报）";
 }
 
 export async function handleIncomingText(
@@ -664,14 +780,87 @@ export async function handleIncomingText(
     }
   }
 
-  // 2. Slash Commands
+  // 2. Slash Commands (Execute immediately out-of-band without blocking on LLM queue!)
+  if (trimmed === "/stop" || trimmed.startsWith("/stop ")) {
+    const targetArg = trimmed.slice(5).trim();
+
+    if (targetArg && targetArg.toLowerCase() !== "all") {
+      const scout = db.prepare(`SELECT * FROM scouts WHERE scout_id = ?`).get(targetArg) as any;
+      if (!scout) {
+        const msg = `❌ 未找到子分支: \`${targetArg}\``;
+        if (sendReply) await sendReply(msg);
+        return msg;
+      }
+      await opencode.session.abort({ path: { id: scout.session_id } }).catch(() => {});
+      db.prepare(`UPDATE scouts SET status = 'stopped', callback_sent = 1, updated_at = CURRENT_TIMESTAMP WHERE scout_id = ?`).run(scout.scout_id);
+      if (scout.intent_id) {
+        db.prepare(`UPDATE intents SET status = 'stopped' WHERE id = ?`).run(scout.intent_id);
+      }
+      const st = sessionStates.get(scout.session_id);
+      if (st) {
+        st.busy = false;
+        st.currentTool = null;
+      }
+      const msg = `🛑 已终止子分支 **${scout.scout_id}** (已执行 \`${scout.steps_used}/${scout.max_steps}\` 轮)。`;
+      if (sendReply) await sendReply(msg);
+      return msg;
+    }
+
+    // Default /stop or /stop all: abort Main Agent + all running Scouts in current session
+    bumpSessionEpoch(mainSessionId);
+    await opencode.session.abort({ path: { id: mainSessionId } }).catch(() => {});
+    const mainSt = sessionStates.get(mainSessionId);
+    if (mainSt) {
+      mainSt.busy = false;
+      mainSt.currentTool = null;
+    }
+
+    const runningScouts = db.prepare(`SELECT * FROM scouts WHERE parent_session_id = ? AND status = 'running'`).all(mainSessionId) as any[];
+    const stoppedIds: string[] = [];
+    for (const s of runningScouts) {
+      await opencode.session.abort({ path: { id: s.session_id } }).catch(() => {});
+      db.prepare(`UPDATE scouts SET status = 'stopped', callback_sent = 1, updated_at = CURRENT_TIMESTAMP WHERE scout_id = ?`).run(s.scout_id);
+      if (s.intent_id) {
+        db.prepare(`UPDATE intents SET status = 'stopped' WHERE id = ?`).run(s.intent_id);
+      }
+      const st = sessionStates.get(s.session_id);
+      if (st) {
+        st.busy = false;
+        st.currentTool = null;
+      }
+      stoppedIds.push(s.scout_id);
+    }
+
+    const msg = stoppedIds.length > 0
+      ? `🛑 已终止主脑当前任务，并停止 ${stoppedIds.length} 个运行中的子分支 (\`${stoppedIds.join("`, `")}\`)。`
+      : `🛑 已终止主脑当前任务。`;
+    if (sendReply) await sendReply(msg);
+    return msg;
+  }
+
   if (trimmed === "/new") {
+    // 1. Abort active Main Agent turn & any running Scouts before wiping state
+    bumpSessionEpoch(mainSessionId);
+    await opencode.session.abort({ path: { id: mainSessionId } }).catch(() => {});
+    const allScouts = db.prepare(`SELECT session_id FROM scouts`).all() as any[];
+    for (const s of allScouts) {
+      if (s.session_id) {
+        await opencode.session.abort({ path: { id: s.session_id } }).catch(() => {});
+        sessionStates.delete(s.session_id);
+      }
+    }
+    sessionStates.delete(mainSessionId);
+    mainTurnQueues.delete(mainSessionId);
+
+    // 2. Wipe all Scout workspaces on disk and reset SQLite blackboard + AUTOINCREMENT sequences
     const cleanRes = cleanScoutWorkspaces({
       mainSessionId,
       all: true,
       includeRunning: true
     });
     resetBlackboardForNewSession();
+
+    // 3. Create fresh Strategist session
     const created = await opencode.session.create({
       body: { title: `Feishu Main Strategist (${chatId}) - ${new Date().toISOString()}` }
     });
@@ -679,8 +868,8 @@ export async function handleIncomingText(
     db.prepare(`INSERT OR REPLACE INTO chat_bindings (chat_id, main_session_id, last_user_msg_id, updated_at) VALUES (?, ?, ?, CURRENT_TIMESTAMP)`)
       .run(chatId, newId, userMsgId || null);
     const cleanedNote = cleanRes.cleaned_scouts.length > 0
-      ? `\n🧹 已自动清空 ${cleanRes.cleaned_scouts.length} 个历史 Scout 工作区 (${cleanRes.cleaned_scouts.join(", ")})。`
-      : `\n🧹 工作区目录已处于干净状态。`;
+      ? `\n🧹 已自动清空 ${cleanRes.cleaned_scouts.length} 个历史 Scout 工作区 (${cleanRes.cleaned_scouts.join(", ")})，所有编号已重置从 1 开始。`
+      : `\n🧹 工作区与所有编号（Intent #1 / Scout-1）已重置就绪。`;
     const msg = `🆕 已开启新会话 (\`${newId}\`) 与空白探索图黑板。${cleanedNote}`;
     if (sendReply) await sendReply(msg);
     return msg;
@@ -715,7 +904,10 @@ export async function handleIncomingText(
       : ov.scouts.map((s: any) => {
           const st = sessionStates.get(s.session_id);
           const liveAct = s.status === "running" && st?.busy ? ` | ${st.activity}` : "";
-          return `  - **${s.scout_id}** [${s.status}${liveAct}] 轮数: \`${s.steps_used}/${s.max_steps}\` | 模型: \`${s.model}\`\n    目标: ${s.goal.slice(0, 80)}\n    工作区: \`${s.workspace_dir}\`${s.report_summary ? `\n    摘要: ${s.report_summary}` : ""}`;
+          const remainSec = s.status === "running" && s.deadline_at
+            ? ` | 剩余超时: \`${Math.max(0, Math.round((Number(s.deadline_at) - Date.now()) / 1000))}s\``
+            : "";
+          return `  - **${s.scout_id}** [${s.status}${liveAct}] 轮数: \`${s.steps_used}/${s.max_steps}\`${remainSec} | 模型: \`${s.model}\`\n    目标: ${s.goal.slice(0, 80)}\n    工作区: \`${s.workspace_dir}\`${s.report_summary ? `\n    摘要: ${s.report_summary}` : ""}`;
         }).join("\n");
     const factLines = ov.facts.slice(0, 8).map((f: any) => `  - [#${f.id} by ${f.scout_id}] ${f.summary}`).join("\n") || "  （暂无）";
     const findingLines = ov.findings.map((f: any) => `  - 🔥 [#${f.id} ${f.severity.toUpperCase()}] **${f.title}** (${f.vuln_class}): ${f.summary}`).join("\n") || "  （暂无）";
@@ -914,10 +1106,10 @@ export async function handleIncomingText(
     try { files = readdirSync(scout.workspace_dir); } catch {}
     const msg =
       `📑 **${scout.scout_id} 完整详细报告**\n` +
-      `- 状态: \`${scout.status}\` | 轮数: \`${scout.steps_used}/${scout.max_steps}\`\n` +
+      `- 状态: \`${scout.status}\` | 轮数: \`${scout.steps_used}/${scout.max_steps}\` | 超时设置: \`${scout.timeout_sec}s\`\n` +
       `- 专属工作区: \`${scout.workspace_dir}\` (文件: ${files.join(", ") || "空"})\n` +
       `- 核心摘要: ${scout.report_summary || "（尚未结案）"}\n\n` +
-      `---\n${scout.report_detail || "（子 Agent 仍在静默探索中，完成后将自动推送最终汇报）"}`;
+      `---\n${scout.report_detail || "（子 Agent 尚未提交报告，可让主脑调用 get_scout_detail 查看其最后几轮工具调用入参）"}`;
     if (sendReply) await sendReply(msg);
     return msg;
   }
@@ -969,19 +1161,25 @@ export async function handleIncomingText(
     const parts = trimmed.slice(8).trim().split(/\s+/);
     const scoutId = parts[0];
     const addTurns = parseInt(parts[1] || "40", 10);
-    const extraInstr = parts.slice(2).join(" ");
+    const maybeTimeout = parts[2] && /^\d+$/.test(parts[2]) ? parseInt(parts[2], 10) : undefined;
+    const extraInstr = maybeTimeout !== undefined ? parts.slice(3).join(" ") : parts.slice(2).join(" ");
     const scout = db.prepare(`SELECT * FROM scouts WHERE scout_id = ?`).get(scoutId) as any;
     if (!scout || isNaN(addTurns)) {
-      const msg = `用法: \`/extend scout-1 40 [可选补充指令]\``;
+      const msg = `用法: \`/extend scout-1 40 [可选超时秒数] [可选补充指令]\``;
       if (sendReply) await sendReply(msg);
       return msg;
     }
     const newMax = (scout.max_steps || 80) + addTurns;
+    const timeoutSec = Math.max(5, maybeTimeout ?? scout.timeout_sec ?? 600);
+    const newDeadlineAt = Date.now() + timeoutSec * 1000;
     if (scout.workspace_dir) {
       mkdirSync(scout.workspace_dir, { recursive: true });
     }
-    db.prepare(`UPDATE scouts SET max_steps = ?, status = 'running', suggest_more_turns = 0, updated_at = CURRENT_TIMESTAMP WHERE scout_id = ?`)
-      .run(newMax, scout.scout_id);
+    db.prepare(`
+      UPDATE scouts
+      SET max_steps = ?, timeout_sec = ?, deadline_at = ?, callback_sent = 0, status = 'running', suggest_more_turns = 0, updated_at = CURRENT_TIMESTAMP
+      WHERE scout_id = ?
+    `).run(newMax, timeoutSec, newDeadlineAt, scout.scout_id);
     if (userMsgId) {
       db.prepare(`UPDATE scouts SET feishu_thread_msg_id = ? WHERE scout_id = ?`).run(userMsgId, scout.scout_id);
     }
@@ -994,11 +1192,11 @@ export async function handleIncomingText(
         model: { providerID, modelID },
         parts: [{
           type: "text",
-          text: `🔋 [已为你追加 +${addTurns} 轮预算，新上限: ${newMax} 步]\n${extraInstr || "请基于已有上下文继续深入探索，完成后调用 submit_scout_report 汇报。"}`
+          text: `🔋 [已为你追加 +${addTurns} 轮预算，新上限: ${newMax} 步，新超时窗口: ${timeoutSec}s]\n${extraInstr || "请基于已有上下文继续深入探索，完成后调用 submit_scout_report 汇报。"}`
         }]
       } as any
     });
-    const msg = `🔋 已为 **${scout.scout_id}** 追加 **+${addTurns}** 轮上限（当前 \`${scout.steps_used}/${newMax}\`），子分支已在后台继续静默探索。`;
+    const msg = `🔋 已为 **${scout.scout_id}** 追加 **+${addTurns}** 轮上限（当前 \`${scout.steps_used}/${newMax}\`，超时窗口 \`${timeoutSec}s\`），子分支已在后台继续静默探索。`;
     if (sendReply) await sendReply(msg);
     return msg;
   }
@@ -1026,80 +1224,108 @@ export async function handleIncomingText(
     const msg =
       `⚡ **紫电 (PurpleLight) · 飞书快捷指令**\n\n` +
       `- \`/status\` / \`/scouts\` : 查看模型状态、探索图黑板与所有 Scout 分支进度\n` +
+      `- \`/stop [scout-id|all]\` : 立即停止主脑当前工作（及运行中的 Scout），或指定停止某个 \`scout-N\`\n` +
       `- \`/provider\` : 查看或切换 \`main\` / \`scout\` 的 Provider (\`deepseek\` / \`openrouter\` / \`custom\`)\n` +
       `- \`/model\` : 实时抓取并查看/切换当前生效 Provider 的模型列表\n` +
       `- \`/report <scout-id>\` : 查看指定子分支的完整结案报告\n` +
       `- \`/hint <scout-id> <内容>\` : 向单个子分支发送定向单播 Hint（也可直接引用回复该分支的最终汇报）\n` +
       `- \`/broadcast <内容>\` : 向所有子分支发送全局广播 Hint\n` +
-      `- \`/extend <scout-id> <轮数> [指令]\` : 为指定子分支动态追加轮数上限并唤醒\n` +
+      `- \`/extend <scout-id> <轮数> [秒数] [指令]\` : 为指定子分支动态追加轮数/超时上限并唤醒\n` +
       `- \`/clean [scout-id|all]\` : 清空指定或全部已完成 Scout 的工作区目录\n` +
       `- \`/approve <id>\` / \`/deny <id>\` : 审批子分支修改工作区外文件的请求\n` +
-      `- \`/new\` : 开启全新的主脑会话并自动清空历史工作区`;
+      `- \`/new\` : 开启全新的主脑会话、重置所有编号并自动清空历史工作区`;
     if (sendReply) await sendReply(msg);
     return msg;
   }
 
-  // 3. Normal Conversation -> Route to Main Agent (Strategist) with live SSE progress & "⏳ Working" heartbeat
-  const mainModelCfg = getAgentModelConfig("main");
-  const turnState = resetSessionTurnState(mainSessionId, MAIN_MAX_ITERATIONS);
-  if (userMsgId) {
-    activeMainTurnReplyMsgId.set(mainSessionId, userMsgId);
-  }
-
-  let turnDone = false;
-  let heartbeatMsgId: string | undefined;
-  const heartbeatTimer = setInterval(async () => {
-    if (turnDone || !chatId.startsWith("oc_")) return;
-    const elapsedMs = Date.now() - turnState.startedAt;
-    if (elapsedMs < WORKING_HEARTBEAT_MS) return;
-    const hbText = buildWorkingHeartbeatText({
-      elapsedMs,
-      iteration: turnState.iteration || 1,
-      maxIterations: MAIN_MAX_ITERATIONS,
-      activity: turnState.activity || "waiting for provider response (streaming)"
-    });
-    if (heartbeatMsgId) {
-      const ok = await editFeishuMessage(heartbeatMsgId, hbText);
-      if (ok) return;
-    }
-    heartbeatMsgId = await sendFeishuMessage(chatId, hbText, { replyToMsgId: userMsgId });
-  }, WORKING_HEARTBEAT_MS);
-
-  try {
-    const res = await opencode.session.prompt({
-      path: { id: mainSessionId },
-      body: {
-        agent: "strategist",
-        variant: "max",
-        model: { providerID: mainModelCfg.providerID, modelID: mainModelCfg.modelID },
-        parts: [{ type: "text", text: trimmed }]
-      } as any
-    });
-
-    if (res.error) {
-      const errMsg = `⚠️ 主脑调用异常: ${JSON.stringify(res.error)}`;
-      if (sendReply) await sendReply(errMsg);
-      return errMsg;
-    }
-
-    const replyText = extractReplyText(res.data?.parts as any[]);
-    if (sendReply) await sendReply(replyText);
-    return replyText;
-  } finally {
-    turnDone = true;
-    clearInterval(heartbeatTimer);
-    activeMainTurnReplyMsgId.delete(mainSessionId);
-  }
+  // 3. Normal Conversation -> Enqueue on Main Session Serializing Turn Queue
+  return await enqueueMainAgentTurn(mainSessionId, (epochAtEnqueue) =>
+    executeMainAgentPrompt({
+      chatId,
+      mainSessionId,
+      promptText: trimmed,
+      replyToMsgId: userMsgId,
+      sendReply,
+      epochAtEnqueue
+    })
+  );
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Background Outbox Poller -> ONLY Delivers Scout Final Report (& Workspace Guardrail Approvals)
-// Intermediate Scout process & tool calls are suppressed to keep main chat clean!
+// Scout Lifecycle Watchdog (Timeout & Unreported Exhaustion Detection)
+// ─────────────────────────────────────────────────────────────────────────────
+
+function startScoutLifecycleWatchdog() {
+  setInterval(async () => {
+    const now = Date.now();
+    const activeScouts = db.prepare(`
+      SELECT * FROM scouts WHERE callback_sent = 0 AND status IN ('running', 'exhausted')
+    `).all() as any[];
+
+    for (const s of activeScouts) {
+      // 1. Check wall-clock timeout on running Scouts
+      if (s.status === "running" && s.deadline_at && now > Number(s.deadline_at)) {
+        db.prepare(`
+          UPDATE scouts
+          SET status = 'timeout', callback_sent = 1, report_summary = COALESCE(NULLIF(report_summary, ''), '执行超时被系统 Watchdog 自动中断'), updated_at = CURRENT_TIMESTAMP
+          WHERE scout_id = ?
+        `).run(s.scout_id);
+
+        if (s.intent_id) {
+          db.prepare(`UPDATE intents SET status = 'timeout' WHERE id = ?`).run(s.intent_id);
+        }
+
+        await opencode.session.abort({ path: { id: s.session_id } }).catch(() => {});
+        const st = sessionStates.get(s.session_id);
+        if (st) {
+          st.busy = false;
+          st.currentTool = null;
+        }
+
+        pushOutboxEvent(s.parent_session_id, s.scout_id, "scout_abnormal_exit", {
+          scout_id: s.scout_id,
+          reason: "timeout",
+          goal: s.goal,
+          steps_used: s.steps_used,
+          max_steps: s.max_steps,
+          timeout_sec: s.timeout_sec
+        });
+        continue;
+      }
+
+      // 2. Check if an exhausted Scout stopped running without calling submit_scout_report
+      if (s.status === "exhausted") {
+        const st = sessionStates.get(s.session_id);
+        const updatedMs = s.updated_at ? new Date(s.updated_at + "Z").getTime() : 0;
+        const idleLongEnough = (!st?.busy && now - (st?.lastEventAt || 0) > 8_000) || (updatedMs > 0 && now - updatedMs > 15_000);
+        if (idleLongEnough) {
+          db.prepare(`
+            UPDATE scouts
+            SET callback_sent = 1, report_summary = COALESCE(NULLIF(report_summary, ''), '达到轮数上限未调用 submit_scout_report 退出'), updated_at = CURRENT_TIMESTAMP
+            WHERE scout_id = ?
+          `).run(s.scout_id);
+
+          await opencode.session.abort({ path: { id: s.session_id } }).catch(() => {});
+          pushOutboxEvent(s.parent_session_id, s.scout_id, "scout_abnormal_exit", {
+            scout_id: s.scout_id,
+            reason: "exhausted",
+            goal: s.goal,
+            steps_used: s.steps_used,
+            max_steps: s.max_steps,
+            timeout_sec: s.timeout_sec
+          });
+        }
+      }
+    }
+  }, 2000);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Background Outbox Poller -> Delivers Scout Final Report & Wakes Main Agent via Callback!
 // ─────────────────────────────────────────────────────────────────────────────
 
 function startOutboxPoller() {
   setInterval(async () => {
-    if (!activeLarkClient) return;
     const events = db.prepare(`SELECT * FROM events_outbox WHERE delivered = 0 ORDER BY id ASC LIMIT 20`).all() as any[];
     for (const ev of events) {
       if (!ev.main_session_id) {
@@ -1107,7 +1333,7 @@ function startOutboxPoller() {
         continue;
       }
       const chatRow = db.prepare(`SELECT chat_id, last_user_msg_id FROM chat_bindings WHERE main_session_id = ?`).get(ev.main_session_id) as any;
-      if (!chatRow?.chat_id || !chatRow.chat_id.startsWith("oc_")) {
+      if (!chatRow?.chat_id) {
         db.prepare(`UPDATE events_outbox SET delivered = 1 WHERE id = ?`).run(ev.id);
         continue;
       }
@@ -1117,30 +1343,89 @@ function startOutboxPoller() {
       const p = JSON.parse(ev.payload_json || "{}");
       const scoutRow = p.scout_id ? (db.prepare(`SELECT feishu_thread_msg_id FROM scouts WHERE scout_id = ?`).get(p.scout_id) as any) : null;
       const replyAnchor = scoutRow?.feishu_thread_msg_id || chatRow.last_user_msg_id || undefined;
-      let msg = "";
 
       if (ev.event_type === "scout_report_submitted") {
         const preview = p.detail.length > 2500
-          ? p.detail.slice(0, 2500) + `\n\n...(全文共 ${p.detail.length} 字，已完整注入主会话，可发 \`/report ${p.scout_id}\` 查看全文)`
+          ? p.detail.slice(0, 2500) + `\n\n...(全文共 ${p.detail.length} 字，可发 \`/report ${p.scout_id}\` 查看全文)`
           : p.detail;
-        msg =
+        const reportMsg =
           `✅ **[${p.scout_id} 最终汇报]** (轮数: \`${p.steps_used}/${p.max_steps}\` | 状态: \`${p.status}\`)\n` +
           `- **核心摘要**: ${p.summary}\n` +
-          (p.suggest_more_turns ? `- ⚠️ **申请追加轮数**: 是 (${p.suggested_next_steps || "可发 /extend " + p.scout_id + " 40 继续探索"})\n` : "") +
+          (p.suggest_more_turns ? `- ⚠️ **申请追加轮数**: 是 (${p.suggested_next_steps || "可调用 extend_scout 继续探索"})\n` : "") +
           `\n---\n${preview}`;
-      } else if (ev.event_type === "hook_approval_needed") {
-        msg =
-          `🛡️ **[Hook 越界文件修改拦截 — Approval #${p.approval_id}]**\n` +
-          `- 子分支: \`${p.scout_id}\` | 工具: \`${p.tool_name}\`\n` +
-          `- 目标路径: \`${p.target_path}\` (位于专属工作区 \`${p.workspace_dir}\` 外)\n\n` +
-          `请在 120 秒内回复 \`/approve ${p.approval_id}\` 或 \`/deny ${p.approval_id}\``;
-      }
 
-      if (msg) {
-        const sentMsgId = await sendFeishuMessage(chatId, msg, { replyToMsgId: replyAnchor });
-        if (sentMsgId && p.scout_id) {
-          db.prepare(`INSERT OR REPLACE INTO thread_bindings (thread_msg_id, scout_id, chat_id) VALUES (?, ?, ?)`)
-            .run(sentMsgId, p.scout_id, chatId);
+        let sentReportMsgId: string | undefined;
+        if (activeLarkClient && chatId.startsWith("oc_")) {
+          sentReportMsgId = await sendFeishuMessage(chatId, reportMsg, { replyToMsgId: replyAnchor });
+          if (sentReportMsgId && p.scout_id) {
+            db.prepare(`INSERT OR REPLACE INTO thread_bindings (thread_msg_id, scout_id, chat_id) VALUES (?, ?, ?)`)
+              .run(sentReportMsgId, p.scout_id, chatId);
+          }
+        }
+
+        // Wake / activate Main Agent automatically via serialized callback turn!
+        const callbackPrompt =
+          `🔔 [系统自动回调激活 — 子分支 ${p.scout_id} 已完成并提交最终汇报]\n` +
+          `- 状态: ${p.status} | 消耗轮数: ${p.steps_used}/${p.max_steps}\n` +
+          `- 原始任务: ${p.goal || ""}\n` +
+          `- 核心摘要: ${p.summary}\n` +
+          (p.suggest_more_turns ? `- ⚠️ 子分支申请追加轮数: 是 (建议下一步: ${p.suggested_next_steps || "继续深入"})\n` : "") +
+          `- 完整报告正文:\n${p.detail}\n\n` +
+          `请审阅上述子分支汇报，决定下一步编排动作（如需要可继续调用 extend_scout、fork_scout、record_fact 等），或直接向用户给出你的分析总结与下一步建议。`;
+
+        const anchorForMain = sentReportMsgId || replyAnchor;
+        enqueueMainAgentTurn(ev.main_session_id, (epochAtEnqueue) =>
+          executeMainAgentPrompt({
+            chatId,
+            mainSessionId: ev.main_session_id,
+            promptText: callbackPrompt,
+            replyToMsgId: anchorForMain,
+            sendReply: async (replyContent) => {
+              return await sendFeishuMessage(chatId, replyContent, { replyToMsgId: anchorForMain });
+            },
+            epochAtEnqueue
+          })
+        ).catch((err) => console.error("[Scout Report Callback Error]:", err));
+      } else if (ev.event_type === "scout_abnormal_exit") {
+        const isTimeout = p.reason === "timeout";
+        const reasonLabel = isTimeout
+          ? `执行超时 (${p.timeout_sec}s)`
+          : `达到轮数上限 (${p.steps_used}/${p.max_steps} 步) 未提交结案报告`;
+
+        let sentAlertId: string | undefined;
+        if (activeLarkClient && chatId.startsWith("oc_")) {
+          const alertMsg = `⚠️ **[${p.scout_id} 异常退出通知]** 原因: ${reasonLabel}（正在自动唤醒主脑诊断原因...）`;
+          sentAlertId = await sendFeishuMessage(chatId, alertMsg, { replyToMsgId: replyAnchor });
+        }
+
+        const callbackPrompt =
+          `⚠️ [系统自动回调激活 — 子分支 ${p.scout_id} 异常退出 (${p.reason})]\n` +
+          `- 退出原因: ${reasonLabel}\n` +
+          `- 已执行轮数: ${p.steps_used}/${p.max_steps} | 超时设置: ${p.timeout_sec}s\n` +
+          `- 原始任务: ${p.goal || ""}\n\n` +
+          `请立即调用 \`get_scout_detail(scout_id="${p.scout_id}")\` 查看该子分支最后几轮的消息与工具调用入参，判断它卡住或未完成的原因，并决定是调用 \`extend_scout\` 追加预算/超时继续探索、换思路重新派发，还是向用户汇报诊断结论。`;
+
+        const anchorForMain = sentAlertId || replyAnchor;
+        enqueueMainAgentTurn(ev.main_session_id, (epochAtEnqueue) =>
+          executeMainAgentPrompt({
+            chatId,
+            mainSessionId: ev.main_session_id,
+            promptText: callbackPrompt,
+            replyToMsgId: anchorForMain,
+            sendReply: async (replyContent) => {
+              return await sendFeishuMessage(chatId, replyContent, { replyToMsgId: anchorForMain });
+            },
+            epochAtEnqueue
+          })
+        ).catch((err) => console.error("[Scout Abnormal Exit Callback Error]:", err));
+      } else if (ev.event_type === "hook_approval_needed") {
+        if (activeLarkClient && chatId.startsWith("oc_")) {
+          const msg =
+            `🛡️ **[Hook 越界文件修改拦截 — Approval #${p.approval_id}]**\n` +
+            `- 子分支: \`${p.scout_id}\` | 工具: \`${p.tool_name}\`\n` +
+            `- 目标路径: \`${p.target_path}\` (位于专属工作区 \`${p.workspace_dir}\` 外)\n\n` +
+            `请在 120 秒内回复 \`/approve ${p.approval_id}\` 或 \`/deny ${p.approval_id}\``;
+          await sendFeishuMessage(chatId, msg, { replyToMsgId: replyAnchor });
         }
       }
     }
@@ -1254,6 +1539,7 @@ function tryStartFeishuWS() {
 }
 
 startOpencodeEventStream();
+startScoutLifecycleWatchdog();
 startOutboxPoller();
 tryStartFeishuWS();
 setInterval(tryStartFeishuWS, 3000);

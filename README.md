@@ -83,6 +83,7 @@ Or install as persistent `systemd` services using the unit templates under [`dep
 | Command | Description |
 | :--- | :--- |
 | `/status` or `/scouts` | View active `main`/`scout` models, Exploration Graph counts, and Scout progress |
+| `/stop [scout-id\|all]` | Immediately abort the active Strategist turn (and running Scouts) or stop a specific `scout-N` |
 | `/provider` | Show or switch active provider (`deepseek` / `openrouter` / `custom`) per role |
 | `/provider set custom <url> <key>` | Configure a custom OpenAI-compatible endpoint dynamically |
 | `/model [keyword]` | Dynamically fetch live `/models` from the active provider(s) |
@@ -90,10 +91,10 @@ Or install as persistent `systemd` services using the unit templates under [`dep
 | `/report <scout-id>` | Read the full unclipped report and workspace file list of a Scout |
 | `/hint <scout-id> <text>` | Send a targeted **unicast** hint to one Scout (or quote-reply its report) |
 | `/broadcast <text>` | **Broadcast** a new global hint to all forked Scouts |
-| `/extend <scout-id> <turns> [note]` | Dynamically add step budget (e.g. `+40`) and wake a Scout to continue |
+| `/extend <scout-id> <turns> [sec] [note]` | Dynamically add step/timeout budget and wake a Scout to continue |
 | `/clean [scout-id\|all]` | Clean a specific Scout's workspace or all completed Scout workspaces |
 | `/approve <id>` / `/deny <id>` | Approve or reject out-of-workspace file write hooks |
-| `/new` | Start a fresh Strategist session, clean Exploration Graph, and auto-wipe Scout workspaces |
+| `/new` | Abort leftover tasks, start a fresh Strategist session, reset all IDs to 1, and auto-wipe Scout workspaces |
 
 ---
 

@@ -72,6 +72,9 @@ CREATE TABLE IF NOT EXISTS scouts (
   status TEXT NOT NULL DEFAULT 'running',
   steps_used INTEGER NOT NULL DEFAULT 0,
   max_steps INTEGER NOT NULL DEFAULT 80,
+  timeout_sec INTEGER NOT NULL DEFAULT 600,
+  deadline_at INTEGER,
+  callback_sent INTEGER NOT NULL DEFAULT 0,
   report_summary TEXT NOT NULL DEFAULT '',
   report_detail TEXT NOT NULL DEFAULT '',
   suggest_more_turns INTEGER NOT NULL DEFAULT 0,
@@ -132,9 +135,17 @@ CREATE TABLE IF NOT EXISTS agent_settings (
 );
 `);
 
-try {
-  db.exec(`ALTER TABLE chat_bindings ADD COLUMN last_user_msg_id TEXT;`);
-} catch {}
+// Safe migrations for existing databases
+for (const sql of [
+  `ALTER TABLE chat_bindings ADD COLUMN last_user_msg_id TEXT;`,
+  `ALTER TABLE scouts ADD COLUMN timeout_sec INTEGER NOT NULL DEFAULT 600;`,
+  `ALTER TABLE scouts ADD COLUMN deadline_at INTEGER;`,
+  `ALTER TABLE scouts ADD COLUMN callback_sent INTEGER NOT NULL DEFAULT 0;`
+]) {
+  try {
+    db.exec(sql);
+  } catch {}
+}
 
 db.prepare(`
   INSERT OR IGNORE INTO agent_settings (role, provider_id, model_id)
@@ -280,7 +291,13 @@ export function resetBlackboardForNewSession() {
     DELETE FROM hook_approvals;
     DELETE FROM thread_bindings;
     DELETE FROM events_outbox;
+    DELETE FROM sqlite_sequence WHERE name IN (
+      'intents',
+      'facts',
+      'findings',
+      'hints',
+      'hook_approvals',
+      'events_outbox'
+    );
   `);
 }
-
-
