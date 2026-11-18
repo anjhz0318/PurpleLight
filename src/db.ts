@@ -1,10 +1,12 @@
 import { Database } from "bun:sqlite";
-import { mkdirSync } from "fs";
-import { join, resolve } from "path";
+import { existsSync, mkdirSync, readdirSync, rmSync } from "fs";
+import { join, resolve, relative } from "path";
 
 export const PROJECT_ROOT = resolve(import.meta.dir, "..");
 export const DATA_DIR = join(PROJECT_ROOT, "data");
+export const WORKSPACES_ROOT = join(PROJECT_ROOT, "workspaces");
 mkdirSync(DATA_DIR, { recursive: true });
+mkdirSync(WORKSPACES_ROOT, { recursive: true });
 
 export const db = new Database(join(DATA_DIR, "PurpleLight.db"), { create: true });
 db.exec("PRAGMA journal_mode = WAL;");
@@ -187,3 +189,84 @@ export function getGraphOverview(mainSessionId: string) {
   const scouts = db.prepare(`SELECT * FROM scouts WHERE parent_session_id = ? ORDER BY created_at DESC`).all(mainSessionId) as any[];
   return { intents, facts, findings, hints, scouts };
 }
+
+export interface CleanWorkspacesResult {
+  cleaned_scouts: string[];
+  cleaned_dirs: string[];
+  skipped_running: string[];
+}
+
+function isSafeWorkspaceSubdir(targetDir: string): boolean {
+  const absRoot = resolve(WORKSPACES_ROOT);
+  const absTarget = resolve(targetDir);
+  const rel = relative(absRoot, absTarget);
+  return rel !== "" && !rel.startsWith("..") && !rel.startsWith("/");
+}
+
+export function cleanScoutWorkspaces(opts: {
+  mainSessionId?: string;
+  scoutId?: string;
+  all?: boolean;
+  includeRunning?: boolean;
+}): CleanWorkspacesResult {
+  const cleanedScouts: string[] = [];
+  const cleanedDirs: string[] = [];
+  const skippedRunning: string[] = [];
+  const includeRunning = !!opts.includeRunning;
+
+  if (opts.scoutId) {
+    const scout = db.prepare(`SELECT * FROM scouts WHERE scout_id = ?`).get(opts.scoutId) as any;
+    if (scout && scout.status === "running" && !includeRunning) {
+      skippedRunning.push(scout.scout_id);
+      return { cleaned_scouts: cleanedScouts, cleaned_dirs: cleanedDirs, skipped_running: skippedRunning };
+    }
+    const dir = scout?.workspace_dir || join(WORKSPACES_ROOT, opts.scoutId);
+    if (isSafeWorkspaceSubdir(dir) && existsSync(dir)) {
+      rmSync(dir, { recursive: true, force: true });
+      cleanedScouts.push(opts.scoutId);
+      cleanedDirs.push(dir);
+    }
+    return { cleaned_scouts: cleanedScouts, cleaned_dirs: cleanedDirs, skipped_running: skippedRunning };
+  }
+
+  const rows = opts.all
+    ? (db.prepare(`SELECT * FROM scouts`).all() as any[])
+    : opts.mainSessionId
+      ? (db.prepare(`SELECT * FROM scouts WHERE parent_session_id = ?`).all(opts.mainSessionId) as any[])
+      : [];
+
+  const runningDirs = new Set<string>();
+  for (const s of rows) {
+    if (s.status === "running" && !includeRunning) {
+      skippedRunning.push(s.scout_id);
+      if (s.workspace_dir) runningDirs.add(resolve(s.workspace_dir));
+      continue;
+    }
+    if (s.workspace_dir && isSafeWorkspaceSubdir(s.workspace_dir) && existsSync(s.workspace_dir)) {
+      rmSync(s.workspace_dir, { recursive: true, force: true });
+      cleanedScouts.push(s.scout_id);
+      cleanedDirs.push(s.workspace_dir);
+    }
+  }
+
+  if (opts.all) {
+    try {
+      for (const entry of readdirSync(WORKSPACES_ROOT)) {
+        const fullPath = join(WORKSPACES_ROOT, entry);
+        if (runningDirs.has(resolve(fullPath))) continue;
+        if (isSafeWorkspaceSubdir(fullPath) && existsSync(fullPath)) {
+          rmSync(fullPath, { recursive: true, force: true });
+          if (!cleanedScouts.includes(entry)) cleanedScouts.push(entry);
+          if (!cleanedDirs.includes(fullPath)) cleanedDirs.push(fullPath);
+        }
+      }
+    } catch {}
+  }
+
+  return {
+    cleaned_scouts: cleanedScouts,
+    cleaned_dirs: cleanedDirs,
+    skipped_running: skippedRunning
+  };
+}
+

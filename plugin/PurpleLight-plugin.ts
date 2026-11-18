@@ -1,11 +1,9 @@
 import { type Plugin, tool } from "@opencode-ai/plugin";
 import { mkdirSync, readdirSync } from "fs";
 import { join, resolve, relative } from "path";
-import { PROJECT_ROOT, db, pushOutboxEvent, getGraphOverview, getAgentModelConfig } from "../src/db";
+import { PROJECT_ROOT, WORKSPACES_ROOT, db, pushOutboxEvent, getGraphOverview, getAgentModelConfig, cleanScoutWorkspaces } from "../src/db";
 
-const WORKSPACES_ROOT = join(PROJECT_ROOT, "workspaces");
 const BILI_SCRIPT_PATH = join(PROJECT_ROOT, "scripts", "bili_sub.py");
-mkdirSync(WORKSPACES_ROOT, { recursive: true });
 
 function getScoutBySession(sessionId: string): any | null {
   return db.prepare(`SELECT * FROM scouts WHERE session_id = ?`).get(sessionId) as any;
@@ -144,9 +142,10 @@ export const PurpleLightPlugin: Plugin = async ({ client }) => {
           `  - \`send_hint\`: 向单个指定 Scout 定向单播发送新线索（静默注入，不影响其他分支）\n` +
           `  - \`broadcast_hint\`: 向所有活跃 Scout 全局广播线索\n` +
           `  - \`extend_scout\`: 为指定 Scout 动态追加轮数上限并唤醒继续探索\n` +
+          `  - \`clean_workspaces\`: 清理指定 Scout 或当前会话下已结束的 Scout 工作区目录\n` +
           `  - \`list_scouts\` / \`get_scout_detail\` / \`graph_overview\`: 查看子分支状态、完整报告与探索图黑板（intents / facts / findings / hints）\n\n` +
           `## 飞书快捷指令（仅在用户询问用法时提示）\n` +
-          `\`/status\`、\`/scouts\`、\`/report <scout-id>\`、\`/hint <scout-id> <内容>\`、\`/broadcast <内容>\`、\`/extend <scout-id> <轮数>\`、\`/provider\`、\`/model\`、\`/approve <id>\`、\`/deny <id>\`、\`/new\`、\`/help\``
+          `\`/status\`、\`/scouts\`、\`/report <scout-id>\`、\`/hint <scout-id> <内容>\`、\`/broadcast <内容>\`、\`/extend <scout-id> <轮数>\`、\`/clean [scout-id|all]\`、\`/provider\`、\`/model\`、\`/approve <id>\`、\`/deny <id>\`、\`/new\`、\`/help\``
         );
       }
     },
@@ -435,6 +434,9 @@ export const PurpleLightPlugin: Plugin = async ({ client }) => {
           if (!scout) {
             throw new Error(`Scout not found: ${args.scout_id}`);
           }
+          if (scout.workspace_dir) {
+            mkdirSync(scout.workspace_dir, { recursive: true });
+          }
           const newMaxSteps = (scout.max_steps || 80) + args.add_turns;
           db.prepare(`
             UPDATE scouts SET max_steps = ?, status = 'running', suggest_more_turns = 0, updated_at = CURRENT_TIMESTAMP
@@ -502,6 +504,28 @@ export const PurpleLightPlugin: Plugin = async ({ client }) => {
           const facts = db.prepare(`SELECT * FROM facts WHERE scout_id = ? ORDER BY id DESC`).all(scout.scout_id);
           const findings = db.prepare(`SELECT * FROM findings WHERE scout_id = ? ORDER BY id DESC`).all(scout.scout_id);
           return JSON.stringify({ scout, workspace_files: files, facts, findings }, null, 2);
+        }
+      }),
+
+      clean_workspaces: tool({
+        description: "清理 Scout 子分支的专属工作区目录 (workspaces/scout-N)。可指定清理单个 scout_id、清理当前主会话下所有已结束的 Scout 工作区，或全量清理所有工作区。",
+        args: {
+          scout_id: tool.schema.string().optional().describe("指定要清理的单个子分支 ID（如 scout-1）；不传则默认清理当前主会话下的 Scout 工作区"),
+          all: tool.schema.boolean().optional().describe("设为 true 时清理 workspaces/ 下的全部历史工作区目录"),
+          include_running: tool.schema.boolean().optional().describe("是否连同仍在 running 状态的子分支工作区一并强制清理（默认 false，保护运行中分支）")
+        },
+        async execute(args, ctx) {
+          const mainId = resolveMainSessionId(ctx.sessionID);
+          const res = cleanScoutWorkspaces({
+            mainSessionId: mainId,
+            scoutId: args.scout_id,
+            all: args.all,
+            includeRunning: args.include_running
+          });
+          return JSON.stringify({
+            status: "ok",
+            ...res
+          }, null, 2);
         }
       }),
 

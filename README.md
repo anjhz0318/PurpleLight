@@ -91,8 +91,9 @@ Or install as persistent `systemd` services using the unit templates under [`dep
 | `/hint <scout-id> <text>` | Send a targeted **unicast** hint to one Scout (or quote-reply its report) |
 | `/broadcast <text>` | **Broadcast** a new global hint to all forked Scouts |
 | `/extend <scout-id> <turns> [note]` | Dynamically add step budget (e.g. `+40`) and wake a Scout to continue |
+| `/clean [scout-id\|all]` | Clean a specific Scout's workspace or all completed Scout workspaces |
 | `/approve <id>` / `/deny <id>` | Approve or reject out-of-workspace file write hooks |
-| `/new` | Start a fresh Strategist session and clean Exploration Graph |
+| `/new` | Start a fresh Strategist session, clean Exploration Graph, and auto-wipe Scout workspaces |
 
 ---
 

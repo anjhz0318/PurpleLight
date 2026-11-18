@@ -34,6 +34,7 @@
         "extend_scout": true,
         "list_scouts": true,
         "get_scout_detail": true,
+        "clean_workspaces": true,
         "submit_scout_report": false
       }
     },
@@ -66,7 +67,8 @@
         "broadcast_hint": false,
         "extend_scout": false,
         "list_scouts": false,
-        "get_scout_detail": false
+        "get_scout_detail": false,
+        "clean_workspaces": false
       }
     }
   },

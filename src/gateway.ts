@@ -1,8 +1,8 @@
 import { createOpencodeClient } from "@opencode-ai/sdk";
 import * as Lark from "@larksuiteoapi/node-sdk";
-import { existsSync, readFileSync, writeFileSync, readdirSync } from "fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync, readdirSync } from "fs";
 import { basename, join } from "path";
-import { PROJECT_ROOT, db, getGraphOverview, getAgentModelConfig, setAgentModelConfig } from "./db";
+import { PROJECT_ROOT, db, getGraphOverview, getAgentModelConfig, setAgentModelConfig, cleanScoutWorkspaces } from "./db";
 
 const OPENCODE_URL = process.env.OPENCODE_URL || "http://127.0.0.1:4096";
 const opencode = createOpencodeClient({ baseUrl: OPENCODE_URL });
@@ -431,6 +431,7 @@ const TOOL_EMOJIS: Record<string, string> = {
   extend_scout: "🔋",
   list_scouts: "📋",
   get_scout_detail: "📑",
+  clean_workspaces: "🧹",
   record_fact: "📌",
   report_finding: "🔥",
   submit_scout_report: "✅"
@@ -476,6 +477,8 @@ export function formatToolProgressBubble(toolName: string, args: Record<string, 
     preview = `${args.scout_id || ""} (+${args.add_turns || 40})`;
   } else if (toolName === "get_scout_detail") {
     preview = oneLineTrunc(args.scout_id || "");
+  } else if (toolName === "clean_workspaces") {
+    preview = args.scout_id ? String(args.scout_id) : args.all ? "all" : "session";
   } else {
     const firstVal = Object.values(args).find((v) => typeof v === "string" && v.trim());
     if (firstVal) preview = oneLineTrunc(firstVal);
@@ -663,13 +666,41 @@ export async function handleIncomingText(
 
   // 2. Slash Commands
   if (trimmed === "/new") {
+    const cleanRes = cleanScoutWorkspaces({
+      mainSessionId,
+      all: true,
+      includeRunning: true
+    });
     const created = await opencode.session.create({
       body: { title: `Feishu Main Strategist (${chatId}) - ${new Date().toISOString()}` }
     });
     const newId = created.data!.id;
     db.prepare(`INSERT OR REPLACE INTO chat_bindings (chat_id, main_session_id, last_user_msg_id, updated_at) VALUES (?, ?, ?, CURRENT_TIMESTAMP)`)
       .run(chatId, newId, userMsgId || null);
-    const msg = `🆕 已开启新会话 (\`${newId}\`) 与空白探索图黑板。`;
+    const cleanedNote = cleanRes.cleaned_scouts.length > 0
+      ? `\n🧹 已自动清空 ${cleanRes.cleaned_scouts.length} 个历史 Scout 工作区 (${cleanRes.cleaned_scouts.join(", ")})。`
+      : `\n🧹 工作区目录已处于干净状态。`;
+    const msg = `🆕 已开启新会话 (\`${newId}\`) 与空白探索图黑板。${cleanedNote}`;
+    if (sendReply) await sendReply(msg);
+    return msg;
+  }
+
+  if (trimmed === "/clean" || trimmed.startsWith("/clean ")) {
+    const arg = trimmed.slice(6).trim();
+    const isAll = !arg || arg.toLowerCase() === "all";
+    const res = cleanScoutWorkspaces({
+      mainSessionId,
+      scoutId: !isAll ? arg : undefined,
+      all: isAll,
+      includeRunning: false
+    });
+    const cleanedLine = res.cleaned_scouts.length > 0
+      ? `✅ 已清空 ${res.cleaned_scouts.length} 个工作区: \`${res.cleaned_scouts.join("`, `")}\``
+      : `🧹 没有需要清理的工作区目录（已处于干净状态）`;
+    const skippedLine = res.skipped_running.length > 0
+      ? `\n⏳ 已跳过仍在运行中的子分支: \`${res.skipped_running.join("`, `")}\``
+      : "";
+    const msg = `${cleanedLine}${skippedLine}`;
     if (sendReply) await sendReply(msg);
     return msg;
   }
@@ -945,6 +976,9 @@ export async function handleIncomingText(
       return msg;
     }
     const newMax = (scout.max_steps || 80) + addTurns;
+    if (scout.workspace_dir) {
+      mkdirSync(scout.workspace_dir, { recursive: true });
+    }
     db.prepare(`UPDATE scouts SET max_steps = ?, status = 'running', suggest_more_turns = 0, updated_at = CURRENT_TIMESTAMP WHERE scout_id = ?`)
       .run(newMax, scout.scout_id);
     if (userMsgId) {
@@ -997,8 +1031,9 @@ export async function handleIncomingText(
       `- \`/hint <scout-id> <内容>\` : 向单个子分支发送定向单播 Hint（也可直接引用回复该分支的最终汇报）\n` +
       `- \`/broadcast <内容>\` : 向所有子分支发送全局广播 Hint\n` +
       `- \`/extend <scout-id> <轮数> [指令]\` : 为指定子分支动态追加轮数上限并唤醒\n` +
+      `- \`/clean [scout-id|all]\` : 清空指定或全部已完成 Scout 的工作区目录\n` +
       `- \`/approve <id>\` / \`/deny <id>\` : 审批子分支修改工作区外文件的请求\n` +
-      `- \`/new\` : 开启全新的主脑会话与空白探索图`;
+      `- \`/new\` : 开启全新的主脑会话并自动清空历史工作区`;
     if (sendReply) await sendReply(msg);
     return msg;
   }
