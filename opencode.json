@@ -84,6 +84,81 @@
       "options": {
         "apiKey": "{env:OPENROUTER_API_KEY}"
       }
+    },
+    "custom": {
+      "name": "Custom OpenAI-Compatible",
+      "npm": "@ai-sdk/openai-compatible",
+      "options": {
+        "baseURL": "{env:CUSTOM_BASE_URL}",
+        "apiKey": "{env:CUSTOM_API_KEY}"
+      },
+      "models": {
+        "anthropic/claude-opus-4.8": {
+          "name": "anthropic/claude-opus-4.8",
+          "reasoning": true,
+          "tool_call": true
+        },
+        "glm-4.5": {
+          "name": "glm-4.5",
+          "reasoning": true,
+          "tool_call": true
+        },
+        "glm-4.5-air": {
+          "name": "glm-4.5-air",
+          "reasoning": true,
+          "tool_call": true
+        },
+        "glm-4.6": {
+          "name": "glm-4.6",
+          "reasoning": true,
+          "tool_call": true
+        },
+        "glm-4.7": {
+          "name": "glm-4.7",
+          "reasoning": true,
+          "tool_call": true
+        },
+        "glm-5": {
+          "name": "glm-5",
+          "reasoning": true,
+          "tool_call": true
+        },
+        "glm-5-turbo": {
+          "name": "glm-5-turbo",
+          "reasoning": true,
+          "tool_call": true
+        },
+        "glm-5.1": {
+          "name": "glm-5.1",
+          "reasoning": true,
+          "tool_call": true
+        },
+        "glm-5.2": {
+          "name": "glm-5.2",
+          "reasoning": true,
+          "tool_call": true
+        },
+        "glm-5.3": {
+          "name": "glm-5.3",
+          "reasoning": true,
+          "tool_call": true
+        },
+        "glm-5.3-flash": {
+          "name": "glm-5.3-flash",
+          "reasoning": true,
+          "tool_call": true
+        },
+        "glm-5.3-flashx": {
+          "name": "glm-5.3-flashx",
+          "reasoning": true,
+          "tool_call": true
+        },
+        "glm-5.3-flashx-legal": {
+          "name": "glm-5.3-flashx-legal",
+          "reasoning": true,
+          "tool_call": true
+        }
+      }
     }
   }
 }

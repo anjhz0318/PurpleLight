@@ -76,6 +76,13 @@ bun run start
 ```
 Or install as persistent `systemd` services using the unit templates under [`deploy/`](./deploy/).
 
+> **Runtime provider changes:** `/provider set ...` rewrites `.env`. The running local
+> `opencode serve` process only resolves `{env:...}` placeholders at startup, so the
+> gateway automatically restarts it when credentials change (default command:
+> `systemctl restart PurpleLight-opencode.service`). Override it with
+> `PURPLELIGHT_OPENCODE_RESTART_CMD`, or set `PURPLELIGHT_SKIP_OPENCODE_RESTART=1`
+> when OpenCode is managed elsewhere and must be restarted manually.
+
 ---
 
 ## 💬 Feishu Slash Commands

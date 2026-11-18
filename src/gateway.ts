@@ -1,5 +1,6 @@
 import { createOpencodeClient } from "@opencode-ai/sdk";
 import * as Lark from "@larksuiteoapi/node-sdk";
+import { exec as execCallback } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, writeFileSync, readdirSync } from "fs";
 import { basename, join } from "path";
 import {
@@ -17,6 +18,7 @@ const OPENCODE_URL = process.env.OPENCODE_URL || "http://127.0.0.1:4096";
 const opencode = createOpencodeClient({ baseUrl: OPENCODE_URL });
 const OPENCODE_CONFIG_PATH = join(PROJECT_ROOT, "opencode.json");
 const ENV_FILE_PATH = join(PROJECT_ROOT, ".env");
+const OPENCODE_RESTART_CMD = process.env.PURPLELIGHT_OPENCODE_RESTART_CMD || "systemctl restart PurpleLight-opencode.service";
 const WORKING_HEARTBEAT_MS = Number(process.env.PURPLELIGHT_HEARTBEAT_MS || 60_000);
 const MAIN_MAX_ITERATIONS = 80;
 const TOOL_PREVIEW_CAP = 72;
@@ -55,16 +57,78 @@ function loadEnvFile(path = ENV_FILE_PATH): Record<string, string> {
   return out;
 }
 
-function upsertEnvVars(updates: Record<string, string>, path = ENV_FILE_PATH) {
+function upsertEnvVars(updates: Record<string, string>, path = ENV_FILE_PATH): string[] {
   const current = loadEnvFile(path);
+  const changed: string[] = [];
   for (const [k, v] of Object.entries(updates)) {
     if (v !== undefined) {
+      if (current[k] !== v) changed.push(k);
       current[k] = v;
       process.env[k] = v;
     }
   }
   const lines = Object.entries(current).map(([k, v]) => `${k}=${v}`);
   writeFileSync(path, lines.join("\n") + "\n", { mode: 0o600 });
+  return changed;
+}
+
+function isLocalOpencode(): boolean {
+  try {
+    const host = new URL(OPENCODE_URL).hostname;
+    return host === "127.0.0.1" || host === "localhost" || host === "::1" || host === "[::1]";
+  } catch {
+    return false;
+  }
+}
+
+// The opencode process reads {env:...} placeholders (and systemd EnvironmentFile)
+// only at startup. If we rewrite .env at runtime, the running backend keeps the
+// old/empty values and resolves provider baseURL to "" -> "Invalid URL". Restart
+// the local backend after credential changes so {env:CUSTOM_*} is re-resolved.
+async function restartOpencodeBackend(reason: string): Promise<boolean> {
+  if (process.env.PURPLELIGHT_SKIP_OPENCODE_RESTART === "1") {
+    console.warn(`[OpenCode Reload] skipped (${reason}); PURPLELIGHT_SKIP_OPENCODE_RESTART=1`);
+    return false;
+  }
+  if (!isLocalOpencode()) {
+    console.warn(`[OpenCode Reload] skipped (${reason}); OPENCODE_URL is not local (${OPENCODE_URL})`);
+    return false;
+  }
+
+  console.log(`[OpenCode Reload] ${reason}; running: ${OPENCODE_RESTART_CMD}`);
+  try {
+    await new Promise<void>((resolve, reject) => {
+      execCallback(OPENCODE_RESTART_CMD, { timeout: 30_000 }, (err, _stdout, stderr) => {
+        if (err) reject(new Error((stderr || err.message || "").trim()));
+        else resolve();
+      });
+    });
+  } catch (e: any) {
+    console.error(`[OpenCode Reload] restart command failed: ${e?.message || e}`);
+    return false;
+  }
+
+  const deadline = Date.now() + 20_000;
+  while (Date.now() < deadline) {
+    try {
+      const resp = await fetch(`${OPENCODE_URL}/config`, { signal: AbortSignal.timeout(1500) });
+      if (resp.ok) {
+        console.log("[OpenCode Reload] backend is ready");
+        return true;
+      }
+    } catch {}
+    await new Promise((r) => setTimeout(r, 500));
+  }
+  console.error("[OpenCode Reload] backend did not become ready within 20s");
+  return false;
+}
+
+async function reloadOpencodeAfterEnvChange(changed: string[]): Promise<string> {
+  if (changed.length === 0) return "";
+  const ok = await restartOpencodeBackend(`env changed: ${changed.join(", ")}`);
+  return ok
+    ? "\n🔄 OpenCode 后端已自动重启并加载新环境变量。"
+    : `\n⚠️ 环境变量已写入 .env，但 OpenCode 后端自动重启失败，请手动执行 \`${OPENCODE_RESTART_CMD}\` 后再重试。`;
 }
 
 function resolveOptionValue(rawVal: string | undefined, envMap: Record<string, string>): string {
@@ -974,7 +1038,7 @@ export async function handleIncomingText(
           if (sendReply) await sendReply(msg);
           return msg;
         }
-        upsertEnvVars({ CUSTOM_BASE_URL: baseURL, CUSTOM_API_KEY: apiKey });
+        const changedEnv = upsertEnvVars({ CUSTOM_BASE_URL: baseURL, CUSTOM_API_KEY: apiKey });
         cfg.provider.custom = {
           name: "Custom OpenAI-Compatible",
           npm: "@ai-sdk/openai-compatible",
@@ -982,8 +1046,9 @@ export async function handleIncomingText(
           models: cfg.provider.custom?.models || {}
         };
         await saveOpencodeConfigAndReload(cfg);
+        const reloadNote = await reloadOpencodeAfterEnvChange(changedEnv);
         await fetchLiveModelsFromEndpoint("custom");
-        const msg = `✅ 已配置 \`custom\` 端点 (\`${baseURL}\`)`;
+        const msg = `✅ 已配置 \`custom\` 端点 (\`${baseURL}\`)${reloadNote}`;
         if (sendReply) await sendReply(msg);
         return msg;
       }
@@ -1000,7 +1065,7 @@ export async function handleIncomingText(
         const envBaseName = targetProv === "deepseek" ? "DEEPSEEK_BASE_URL" : "OPENROUTER_BASE_URL";
         const updates: Record<string, string> = { [envKeyName]: apiKey };
         if (baseURL) updates[envBaseName] = baseURL;
-        upsertEnvVars(updates);
+        const changedEnv = upsertEnvVars(updates);
 
         cfg.provider[targetProv] = cfg.provider[targetProv] || { options: {} };
         cfg.provider[targetProv].options = {
@@ -1008,7 +1073,8 @@ export async function handleIncomingText(
           ...(baseURL ? { baseURL: `{env:${envBaseName}}` } : {})
         };
         await saveOpencodeConfigAndReload(cfg);
-        const msg = `✅ 已更新 \`${targetProv}\` 配置`;
+        const reloadNote = await reloadOpencodeAfterEnvChange(changedEnv);
+        const msg = `✅ 已更新 \`${targetProv}\` 配置${reloadNote}`;
         if (sendReply) await sendReply(msg);
         return msg;
       }
@@ -1466,6 +1532,18 @@ function claimMessageId(msgId: string, chatId: string): boolean {
   return true;
 }
 
+function redactSensitiveLogText(text: string): string {
+  // Never persist raw API keys from /provider set commands into journald.
+  if (!/^\/provider\s+set\s+/i.test(text)) return text;
+  const parts = text.trim().split(/\s+/);
+  if (parts.length < 4) return text;
+  const provider = (parts[2] || "").toLowerCase();
+  if (provider === "custom") {
+    return `${parts[0]} ${parts[1]} ${parts[2]} ${parts[3]} ******`;
+  }
+  return `${parts[0]} ${parts[1]} ${parts[2]} ******${parts.slice(4).length ? " " + parts.slice(4).join(" ") : ""}`;
+}
+
 async function processFeishuMsgItem(
   msgId: string,
   chatId: string,
@@ -1498,7 +1576,7 @@ async function processFeishuMsgItem(
   }
   if (!text) return;
 
-  console.log(`[Feishu WS Incoming] msg=${msgId} chat=${chatId} parent=${parentId || "none"}: ${text}`);
+  console.log(`[Feishu WS Incoming] msg=${msgId} chat=${chatId} parent=${parentId || "none"}: ${redactSensitiveLogText(text)}`);
 
   const reactionId = await addTypingReaction(msgId);
   try {
