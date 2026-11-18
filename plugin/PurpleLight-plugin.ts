@@ -136,18 +136,18 @@ export const PurpleLightPlugin: Plugin = async ({ client }) => {
           `- 专属工作区: ${scout.workspace_dir} (所有脚本、临时文件、下载产物请写在此目录内；修改目录外文件会触发 Hook 拦截审批)\n` +
           `- 预算约束: 轮数已用 ${scout.steps_used}/${scout.max_steps} 步 | 剩余超时时间约 ${remainSec}s (执行 curl/网络请求时务必加上 --max-time 或 timeout 以防单步永久阻塞)\n` +
           `- 如需提取 B 站视频字幕或评论情报，请先调用 skill(name="bilibili-intel") 或执行 python3 ${BILI_SCRIPT_PATH}。\n` +
-          `- 关键验证结论（肯定或证伪）请调用 record_fact；确认关键发现请调用 report_finding；完成任务或轮数耗尽时，必须调用 submit_scout_report 提交完整最终报告（提交后会自动回调唤醒主 Agent）。`
+          `- 关键验证结论（肯定或证伪）请调用 record_fact；确认漏洞请调用 report_finding；完成任务或轮数耗尽时，必须调用 submit_scout_report 提交完整最终报告（提交后会自动回调唤醒主 Agent）。`
         );
       } else {
         // Clear OpenCode's default CLI system prompt ("fewer than 4 lines / One word answers are best")
         output.system.length = 0;
         output.system.push(
-          `你是 **紫电 (PurpleLight)**，多智能体软件工程、安全架构合规审计（Authorized SDLC & Defensive Security Research）与深度研究工作台的主 Agent（Strategist）。\n\n` +
+          `你是 **紫电 (PurpleLight)**，安全漏洞挖掘与研究工作台的主 Agent（Strategist）。\n\n` +
           `## 职责与能力边界\n` +
           `- 为保持主会话上下文洁净，你不直接挂载 \`bash / read / write / grep / skill\` 等底层执行工具。\n` +
-          `- 日常技术交流、架构梳理与思路讨论直接自然回答即可，根据问题本身决定详略。\n` +
-          `- 需要执行具体动作（读取外部文档/报告、用 Skill 提取 B 站视频字幕、代码审查、编写并运行测试验证脚本）时，通过以下编排原语交由子 Agent 完成：\n` +
-          `  - \`add_intent\`: 在探索图黑板登记研究意图或待验证假设\n` +
+          `- 日常技术交流、攻击面梳理与思路讨论直接自然回答即可，根据问题本身决定详略。\n` +
+          `- 需要执行具体动作（读取外部网页/HackerOne 报告、用 Skill 提取 B 站视频情报、审计代码、编写并运行验证脚本）时，通过以下编排原语交由子 Agent 完成：\n` +
+          `  - \`add_intent\`: 在探索图黑板登记探索意图或漏洞假设\n` +
           `  - \`fork_scout\`: 从当前主会话分叉 (Fork) 出继承完整上下文的 Scout 子 Agent，支持设置 \`max_steps\` (默认 80 轮) 与 \`timeout_sec\` (默认 600 秒) 在后台静默执行；当 Scout 正常结案、超时或耗尽轮数时，系统会自动回调唤醒你进行下一步决策\n` +
           `  - \`stop_scout\`: 强制终止指定正在运行或卡住的 Scout 子分支\n` +
           `  - \`send_hint\`: 向单个指定 Scout 定向单播发送新线索（静默注入，不影响其他分支）\n` +
@@ -163,7 +163,7 @@ export const PurpleLightPlugin: Plugin = async ({ client }) => {
 
     tool: {
       graph_overview: tool({
-        description: "查看当前任务的探索图黑板全貌（包含所有 intents 意图、facts 验证事实、findings 关键发现、hints 线索以及 scouts 子分支状态）",
+        description: "查看当前任务的探索图黑板全貌（包含所有 intents 意图、facts 验证事实、findings 确认漏洞、hints 线索以及 scouts 子分支状态）",
         args: {},
         async execute(_args, ctx) {
           const mainId = resolveMainSessionId(ctx.sessionID);
@@ -173,10 +173,10 @@ export const PurpleLightPlugin: Plugin = async ({ client }) => {
       }),
 
       add_intent: tool({
-        description: "在探索图黑板上新增一条研究意图或待验证假设 (Intent)",
+        description: "在探索图黑板上新增一条探索意图/漏洞假设 (Intent)",
         args: {
-          title: tool.schema.string().describe("意图/假设简短标题"),
-          detail: tool.schema.string().describe("意图详细描述、架构逻辑与验证方向"),
+          title: tool.schema.string().describe("意图/猜想简短标题"),
+          detail: tool.schema.string().describe("意图详细描述、攻击面逻辑与验证方向"),
           priority: tool.schema.number().optional().describe("优先级 1-10，默认 5")
         },
         async execute(args, ctx) {
@@ -194,8 +194,8 @@ export const PurpleLightPlugin: Plugin = async ({ client }) => {
         description: "向探索图黑板静默写入一条验证得出的客观事实/结论 (Fact，支持长篇详细 detail 与证据，肯定或否定结论均可记录)",
         args: {
           summary: tool.schema.string().describe("一句话核心结论摘要"),
-          detail: tool.schema.string().describe("详细技术分析、调用链、情报拆解或代码证据（不限长度）"),
-          evidence: tool.schema.string().optional().describe("关键命令输出、文件路径行号或特征记录"),
+          detail: tool.schema.string().describe("详细技术分析、调用链、视频/报告情报拆解或代码证据（不限长度）"),
+          evidence: tool.schema.string().optional().describe("关键命令输出、文件路径行号或流量特征"),
           source: tool.schema.string().optional().describe("来源: code_audit | target_response | tool_output | third_party_intel | inference"),
           confidence: tool.schema.string().optional().describe("置信度: observed | inferred"),
           intent_id: tool.schema.number().optional().describe("关联的 intent_id（可选）")
@@ -225,14 +225,14 @@ export const PurpleLightPlugin: Plugin = async ({ client }) => {
       }),
 
       report_finding: tool({
-        description: "向探索图黑板登记一个已确认的关键问题或高价值架构缺陷发现 (Finding，含完整验证步骤与证据)",
+        description: "向探索图黑板登记一个已确认的漏洞或高价值风险点 (Finding，含完整 PoC 与证据)",
         args: {
-          title: tool.schema.string().describe("发现问题标题"),
+          title: tool.schema.string().describe("漏洞标题"),
           severity: tool.schema.enum(["critical", "high", "medium", "low"]).describe("严重程度"),
-          vuln_class: tool.schema.string().describe("问题分类或缺陷类型"),
-          summary: tool.schema.string().describe("问题一句话原理概述"),
-          poc_detail: tool.schema.string().describe("完整的复现验证步骤、代码位置、测试用例与验证输出（不限字数）"),
-          counterevidence: tool.schema.string().optional().describe("已排除的干扰因素或边界条件说明"),
+          vuln_class: tool.schema.string().describe("漏洞类型，如 SSRF / HTTP Desync / IDOR / RCE / Auth Bypass"),
+          summary: tool.schema.string().describe("漏洞一句话原理概述"),
+          poc_detail: tool.schema.string().describe("完整的复现步骤、代码位置、Payload 与验证输出（不限字数）"),
+          counterevidence: tool.schema.string().optional().describe("已排除的干扰因素或防御边界说明"),
           intent_id: tool.schema.number().optional().describe("关联的 intent_id")
         },
         async execute(args, ctx) {
