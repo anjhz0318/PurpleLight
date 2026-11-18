@@ -1,0 +1,26 @@
+# Dependencies
+node_modules/
+
+# Environment & Secrets (NEVER commit!)
+.env
+.env.*
+!.env.example
+*cookies*.json
+config.json
+
+# Runtime SQLite Blackboard & Isolated Scout Workspaces
+data/
+workspaces/
+*.db
+*.db-wal
+*.db-shm
+
+# Build / Logs / OS
+dist/
+out/
+logs/
+*.log
+.cache/
+.DS_Store
+.idea/
+*.tsbuildinfo

@@ -1,0 +1,24 @@
+{
+  "name": "purplelight",
+  "version": "1.0.0",
+  "description": "PurpleLight (紫电) — Context-Forking Multi-Agent Security Vulnerability Hunting Workbench powered by OpenCode SDK & Feishu WS Gateway",
+  "module": "index.ts",
+  "type": "module",
+  "scripts": {
+    "start": "bun run src/gateway.ts",
+    "opencode": "opencode serve --hostname 127.0.0.1 --port 4096",
+    "typecheck": "bun x tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/bun": "latest"
+  },
+  "peerDependencies": {
+    "typescript": "^5"
+  },
+  "dependencies": {
+    "@larksuiteoapi/node-sdk": "^1.59.0",
+    "@opencode-ai/plugin": "^1.19.6",
+    "@opencode-ai/sdk": "^1.19.6",
+    "zod": "^4.1.8"
+  }
+}

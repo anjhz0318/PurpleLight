@@ -1,0 +1,85 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "model": "deepseek/deepseek-flash",
+  "small_model": "deepseek/deepseek-flash",
+  "plugin": [
+    "./plugin/PurpleLight-plugin.ts"
+  ],
+  "agent": {
+    "strategist": {
+      "mode": "primary",
+      "model": "deepseek/deepseek-flash",
+      "description": "PurpleLight Strategist Microkernel (pure high-level reasoning & scout orchestration)",
+      "tools": {
+        "bash": false,
+        "read": false,
+        "write": false,
+        "edit": false,
+        "grep": false,
+        "glob": false,
+        "webfetch": false,
+        "websearch": false,
+        "skill": false,
+        "task": false,
+        "apply_patch": false,
+        "todowrite": false,
+        "question": false,
+        "graph_overview": true,
+        "add_intent": true,
+        "record_fact": true,
+        "report_finding": true,
+        "fork_scout": true,
+        "send_hint": true,
+        "broadcast_hint": true,
+        "extend_scout": true,
+        "list_scouts": true,
+        "get_scout_detail": true,
+        "submit_scout_report": false
+      }
+    },
+    "scout": {
+      "mode": "all",
+      "model": "deepseek/deepseek-flash",
+      "maxSteps": 80,
+      "description": "PurpleLight Scout Executor (full code/bash/skill capabilities with workspace boundary hook)",
+      "tools": {
+        "bash": true,
+        "read": true,
+        "write": true,
+        "edit": true,
+        "grep": true,
+        "glob": true,
+        "webfetch": true,
+        "websearch": true,
+        "skill": true,
+        "apply_patch": true,
+        "todowrite": true,
+        "task": false,
+        "question": false,
+        "graph_overview": true,
+        "record_fact": true,
+        "report_finding": true,
+        "submit_scout_report": true,
+        "add_intent": false,
+        "fork_scout": false,
+        "send_hint": false,
+        "broadcast_hint": false,
+        "extend_scout": false,
+        "list_scouts": false,
+        "get_scout_detail": false
+      }
+    }
+  },
+  "provider": {
+    "deepseek": {
+      "options": {
+        "apiKey": "{env:DEEPSEEK_API_KEY}"
+      }
+    },
+    "openrouter": {
+      "options": {
+        "apiKey": "{env:OPENROUTER_API_KEY}"
+      }
+    }
+  }
+}
