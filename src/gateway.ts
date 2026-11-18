@@ -2,7 +2,7 @@ import { createOpencodeClient } from "@opencode-ai/sdk";
 import * as Lark from "@larksuiteoapi/node-sdk";
 import { existsSync, mkdirSync, readFileSync, writeFileSync, readdirSync } from "fs";
 import { basename, join } from "path";
-import { PROJECT_ROOT, db, getGraphOverview, getAgentModelConfig, setAgentModelConfig, cleanScoutWorkspaces } from "./db";
+import { PROJECT_ROOT, db, getGraphOverview, getAgentModelConfig, setAgentModelConfig, cleanScoutWorkspaces, resetBlackboardForNewSession } from "./db";
 
 const OPENCODE_URL = process.env.OPENCODE_URL || "http://127.0.0.1:4096";
 const opencode = createOpencodeClient({ baseUrl: OPENCODE_URL });
@@ -671,6 +671,7 @@ export async function handleIncomingText(
       all: true,
       includeRunning: true
     });
+    resetBlackboardForNewSession();
     const created = await opencode.session.create({
       body: { title: `Feishu Main Strategist (${chatId}) - ${new Date().toISOString()}` }
     });

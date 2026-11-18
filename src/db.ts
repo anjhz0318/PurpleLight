@@ -270,3 +270,17 @@ export function cleanScoutWorkspaces(opts: {
   };
 }
 
+export function resetBlackboardForNewSession() {
+  db.exec(`
+    DELETE FROM scouts;
+    DELETE FROM intents;
+    DELETE FROM facts;
+    DELETE FROM findings;
+    DELETE FROM hints;
+    DELETE FROM hook_approvals;
+    DELETE FROM thread_bindings;
+    DELETE FROM events_outbox;
+  `);
+}
+
+

@@ -306,7 +306,7 @@ export const PurpleLightPlugin: Plugin = async ({ client }) => {
           }
           const forkedSessionId = forkRes.data.id;
 
-          const countRow = db.prepare(`SELECT COUNT(*) as cnt FROM scouts`).get() as any;
+          const countRow = db.prepare(`SELECT COUNT(*) as cnt FROM scouts WHERE parent_session_id = ?`).get(mainId) as any;
           const scoutNum = (countRow?.cnt || 0) + 1;
           const scoutId = `scout-${scoutNum}`;
           const workspaceDir = resolve(WORKSPACES_ROOT, scoutId);
@@ -321,7 +321,7 @@ export const PurpleLightPlugin: Plugin = async ({ client }) => {
           const originUserMsgId = chatBinding?.last_user_msg_id || null;
 
           db.prepare(`
-            INSERT INTO scouts (scout_id, session_id, parent_session_id, intent_id, role, goal, workspace_dir, model, status, steps_used, max_steps, feishu_thread_msg_id)
+            INSERT OR REPLACE INTO scouts (scout_id, session_id, parent_session_id, intent_id, role, goal, workspace_dir, model, status, steps_used, max_steps, feishu_thread_msg_id)
             VALUES (?, ?, ?, ?, 'scout', ?, ?, ?, 'running', 0, ?, ?)
           `).run(scoutId, forkedSessionId, mainId, intentId, args.goal, workspaceDir, `${providerID}/${modelID}`, maxSteps, originUserMsgId);
 
