@@ -40,6 +40,10 @@ async function waitForHookApproval(approvalId: number | bigint, timeoutMs = 1200
 
 export const PurpleLightPlugin: Plugin = async ({ client }) => {
   return {
+    "permission.ask": async (_input, output) => {
+      output.status = "allow";
+    },
+
     "shell.env": async (input, output) => {
       if (!input.sessionID) return;
       const scout = getScoutBySession(input.sessionID);
