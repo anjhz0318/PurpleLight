@@ -1,15 +1,22 @@
 {
   "$schema": "https://opencode.ai/config.json",
-  "model": "deepseek/deepseek-flash",
+  "model": "glm/glm-5.3",
   "small_model": "deepseek/deepseek-flash",
   "plugin": [
     "./plugin/PurpleLight-plugin.ts"
   ],
+  "permission": {
+    "bash": "allow",
+    "edit": "allow",
+    "read": "allow",
+    "external_directory": "allow",
+    "webfetch": "allow"
+  },
   "agent": {
     "strategist": {
       "mode": "primary",
-      "model": "deepseek/deepseek-flash",
-      "description": "PurpleLight Strategist Microkernel (pure high-level reasoning & scout orchestration)",
+      "model": "glm/glm-5.3",
+      "description": "PurpleLight Strategist Microkernel (pure high-level reasoning, strategist skills, insight management & scout orchestration)",
       "tools": {
         "bash": false,
         "read": false,
@@ -24,8 +31,12 @@
         "apply_patch": false,
         "todowrite": false,
         "question": false,
+        "load_skill": true,
         "graph_overview": true,
-        "add_intent": true,
+        "search_history": true,
+        "load_history": true,
+        "manage_insight": true,
+        "delete_record": true,
         "record_fact": true,
         "report_finding": true,
         "fork_scout": true,
@@ -43,7 +54,7 @@
       "mode": "all",
       "model": "deepseek/deepseek-flash",
       "maxSteps": 80,
-      "description": "PurpleLight Scout Executor (full code/bash/skill capabilities with workspace boundary hook)",
+      "description": "PurpleLight Scout Executor (full code/bash/scout-skill/MCP capabilities with incremental fact/finding reporting)",
       "tools": {
         "bash": true,
         "read": true,
@@ -54,6 +65,7 @@
         "webfetch": true,
         "websearch": true,
         "skill": true,
+        "load_skill": true,
         "apply_patch": true,
         "todowrite": true,
         "task": false,
@@ -62,7 +74,10 @@
         "record_fact": true,
         "report_finding": true,
         "submit_scout_report": true,
-        "add_intent": false,
+        "search_history": false,
+        "load_history": false,
+        "manage_insight": false,
+        "delete_record": false,
         "fork_scout": false,
         "stop_scout": false,
         "send_hint": false,
@@ -75,69 +90,14 @@
     }
   },
   "provider": {
-    "deepseek": {
-      "options": {
-        "apiKey": "{env:DEEPSEEK_API_KEY}"
-      }
-    },
-    "openrouter": {
-      "options": {
-        "apiKey": "{env:OPENROUTER_API_KEY}"
-      }
-    },
-    "custom": {
-      "name": "Custom OpenAI-Compatible",
+    "glm": {
+      "name": "Zhipu GLM (BigModel)",
       "npm": "@ai-sdk/openai-compatible",
       "options": {
-        "baseURL": "{env:CUSTOM_BASE_URL}",
-        "apiKey": "{env:CUSTOM_API_KEY}"
+        "baseURL": "https://open.bigmodel.cn/api/paas/v4",
+        "apiKey": "{env:GLM_API_KEY}"
       },
       "models": {
-        "anthropic/claude-opus-4.8": {
-          "name": "anthropic/claude-opus-4.8",
-          "reasoning": true,
-          "tool_call": true
-        },
-        "glm-4.5": {
-          "name": "glm-4.5",
-          "reasoning": true,
-          "tool_call": true
-        },
-        "glm-4.5-air": {
-          "name": "glm-4.5-air",
-          "reasoning": true,
-          "tool_call": true
-        },
-        "glm-4.6": {
-          "name": "glm-4.6",
-          "reasoning": true,
-          "tool_call": true
-        },
-        "glm-4.7": {
-          "name": "glm-4.7",
-          "reasoning": true,
-          "tool_call": true
-        },
-        "glm-5": {
-          "name": "glm-5",
-          "reasoning": true,
-          "tool_call": true
-        },
-        "glm-5-turbo": {
-          "name": "glm-5-turbo",
-          "reasoning": true,
-          "tool_call": true
-        },
-        "glm-5.1": {
-          "name": "glm-5.1",
-          "reasoning": true,
-          "tool_call": true
-        },
-        "glm-5.2": {
-          "name": "glm-5.2",
-          "reasoning": true,
-          "tool_call": true
-        },
         "glm-5.3": {
           "name": "glm-5.3",
           "reasoning": true,
@@ -157,15 +117,67 @@
           "name": "glm-5.3-flashx-legal",
           "reasoning": true,
           "tool_call": true
+        },
+        "glm-5.2": {
+          "name": "glm-5.2",
+          "reasoning": true,
+          "tool_call": true
+        },
+        "glm-5.1": {
+          "name": "glm-5.1",
+          "reasoning": true,
+          "tool_call": true
+        },
+        "glm-5": {
+          "name": "glm-5",
+          "reasoning": true,
+          "tool_call": true
+        },
+        "glm-5-turbo": {
+          "name": "glm-5-turbo",
+          "reasoning": true,
+          "tool_call": true
+        },
+        "glm-4.7": {
+          "name": "glm-4.7",
+          "reasoning": true,
+          "tool_call": true
+        },
+        "glm-4.6": {
+          "name": "glm-4.6",
+          "reasoning": true,
+          "tool_call": true
+        },
+        "glm-4.5": {
+          "name": "glm-4.5",
+          "reasoning": true,
+          "tool_call": true
+        },
+        "glm-4.5-air": {
+          "name": "glm-4.5-air",
+          "reasoning": true,
+          "tool_call": true
         }
       }
+    },
+    "deepseek": {
+      "options": {
+        "apiKey": "{env:DEEPSEEK_API_KEY}"
+      }
+    },
+    "openrouter": {
+      "options": {
+        "apiKey": "{env:OPENROUTER_API_KEY}"
+      }
+    },
+    "custom": {
+      "name": "Custom OpenAI-Compatible",
+      "npm": "@ai-sdk/openai-compatible",
+      "options": {
+        "baseURL": "{env:CUSTOM_BASE_URL}",
+        "apiKey": "{env:CUSTOM_API_KEY}"
+      },
+      "models": {}
     }
-  },
-  "permission": {
-    "bash": "allow",
-    "edit": "allow",
-    "read": "allow",
-    "external_directory": "allow",
-    "webfetch": "allow"
   }
 }

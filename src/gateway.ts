@@ -5,12 +5,17 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync, readdirSync } from 
 import { basename, join } from "path";
 import {
   PROJECT_ROOT,
+  SUPPORTED_PROVIDERS,
+  type ProviderID,
+  isSupportedProvider,
   db,
   getGraphOverview,
+  getHistoricalArchiveStats,
   getAgentModelConfig,
   setAgentModelConfig,
   cleanScoutWorkspaces,
   resetBlackboardForNewSession,
+  ensureHuntingSession,
   pushOutboxEvent
 } from "./db";
 
@@ -18,13 +23,16 @@ const OPENCODE_URL = process.env.OPENCODE_URL || "http://127.0.0.1:4096";
 const opencode = createOpencodeClient({ baseUrl: OPENCODE_URL });
 const OPENCODE_CONFIG_PATH = join(PROJECT_ROOT, "opencode.json");
 const ENV_FILE_PATH = join(PROJECT_ROOT, ".env");
-const OPENCODE_RESTART_CMD = process.env.PURPLELIGHT_OPENCODE_RESTART_CMD || "systemctl restart PurpleLight-opencode.service";
+const DEFAULT_GLM_BASE_URL = "https://open.bigmodel.cn/api/paas/v4";
+const OPENCODE_RESTART_CMD =
+  process.env.PURPLELIGHT_OPENCODE_RESTART_CMD || "systemctl restart PurpleLight-opencode.service";
 const WORKING_HEARTBEAT_MS = Number(process.env.PURPLELIGHT_HEARTBEAT_MS || 60_000);
 const MAIN_MAX_ITERATIONS = 80;
 const TOOL_PREVIEW_CAP = 72;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Config, Secret-Safe .env Management & Dynamic Upstream /models Fetching
+// Built-in Providers: `glm` | `deepseek` | `openrouter` | `custom`
 // ─────────────────────────────────────────────────────────────────────────────
 
 function readOpencodeConfig(): any {
@@ -81,10 +89,6 @@ function isLocalOpencode(): boolean {
   }
 }
 
-// The opencode process reads {env:...} placeholders (and systemd EnvironmentFile)
-// only at startup. If we rewrite .env at runtime, the running backend keeps the
-// old/empty values and resolves provider baseURL to "" -> "Invalid URL". Restart
-// the local backend after credential changes so {env:CUSTOM_*} is re-resolved.
 async function restartOpencodeBackend(reason: string): Promise<boolean> {
   if (process.env.PURPLELIGHT_SKIP_OPENCODE_RESTART === "1") {
     console.warn(`[OpenCode Reload] skipped (${reason}); PURPLELIGHT_SKIP_OPENCODE_RESTART=1`);
@@ -144,13 +148,19 @@ interface LiveModelItem {
   context_window?: number;
 }
 
-function getProviderEndpointAndKey(providerID: string, cfg?: any): { baseURL: string; apiKey: string } {
+function getProviderEndpointAndKey(providerID: ProviderID, cfg?: any): { baseURL: string; apiKey: string } {
   const c = cfg || readOpencodeConfig();
   const p = c.provider?.[providerID]?.options || {};
   const env = { ...process.env, ...loadEnvFile() } as Record<string, string>;
   const resolvedBase = resolveOptionValue(p.baseURL, env);
   const resolvedKey = resolveOptionValue(p.apiKey, env);
 
+  if (providerID === "glm") {
+    return {
+      baseURL: (resolvedBase || env.GLM_BASE_URL || DEFAULT_GLM_BASE_URL).replace(/\/+$/, ""),
+      apiKey: resolvedKey || env.GLM_API_KEY || ""
+    };
+  }
   if (providerID === "deepseek") {
     return {
       baseURL: (resolvedBase || env.DEEPSEEK_BASE_URL || "https://api.deepseek.com/v1").replace(/\/+$/, ""),
@@ -169,7 +179,45 @@ function getProviderEndpointAndKey(providerID: string, cfg?: any): { baseURL: st
   };
 }
 
-async function fetchLiveModelsFromEndpoint(providerID: "deepseek" | "openrouter" | "custom"): Promise<{
+function ensureOpenAICompatibleProviderBlock(cfg: any, providerID: "glm" | "custom") {
+  cfg.provider = cfg.provider || {};
+  const env = loadEnvFile();
+  if (providerID === "glm") {
+    cfg.provider.glm = cfg.provider.glm || {
+      name: "Zhipu GLM (BigModel)",
+      npm: "@ai-sdk/openai-compatible",
+      options: {
+        baseURL: env.GLM_BASE_URL ? "{env:GLM_BASE_URL}" : DEFAULT_GLM_BASE_URL,
+        apiKey: "{env:GLM_API_KEY}"
+      },
+      models: {}
+    };
+    cfg.provider.glm.name = cfg.provider.glm.name || "Zhipu GLM (BigModel)";
+    cfg.provider.glm.npm = "@ai-sdk/openai-compatible";
+    cfg.provider.glm.options = cfg.provider.glm.options || {};
+    cfg.provider.glm.options.apiKey = "{env:GLM_API_KEY}";
+    cfg.provider.glm.options.baseURL = env.GLM_BASE_URL ? "{env:GLM_BASE_URL}" : DEFAULT_GLM_BASE_URL;
+    cfg.provider.glm.models = cfg.provider.glm.models || {};
+    return cfg.provider.glm;
+  }
+
+  cfg.provider.custom = cfg.provider.custom || {
+    name: "Custom OpenAI-Compatible",
+    npm: "@ai-sdk/openai-compatible",
+    options: { baseURL: "{env:CUSTOM_BASE_URL}", apiKey: "{env:CUSTOM_API_KEY}" },
+    models: {}
+  };
+  cfg.provider.custom.name = cfg.provider.custom.name || "Custom OpenAI-Compatible";
+  cfg.provider.custom.npm = "@ai-sdk/openai-compatible";
+  cfg.provider.custom.options = cfg.provider.custom.options || {
+    baseURL: "{env:CUSTOM_BASE_URL}",
+    apiKey: "{env:CUSTOM_API_KEY}"
+  };
+  cfg.provider.custom.models = cfg.provider.custom.models || {};
+  return cfg.provider.custom;
+}
+
+async function fetchLiveModelsFromEndpoint(providerID: ProviderID): Promise<{
   ok: boolean;
   baseURL: string;
   models: LiveModelItem[];
@@ -190,7 +238,13 @@ async function fetchLiveModelsFromEndpoint(providerID: "deepseek" | "openrouter"
       return { ok: false, baseURL: url, models: [], error: `HTTP ${resp.status}: ${txt.slice(0, 120)}` };
     }
     const data = (await resp.json()) as any;
-    const rawList = Array.isArray(data?.data) ? data.data : Array.isArray(data?.models) ? data.models : Array.isArray(data) ? data : [];
+    const rawList = Array.isArray(data?.data)
+      ? data.data
+      : Array.isArray(data?.models)
+        ? data.models
+        : Array.isArray(data)
+          ? data
+          : [];
     const models: LiveModelItem[] = rawList
       .map((m: any) => ({
         id: String(m.id || m.name || "").trim(),
@@ -199,19 +253,12 @@ async function fetchLiveModelsFromEndpoint(providerID: "deepseek" | "openrouter"
       }))
       .filter((m: LiveModelItem) => m.id.length > 0);
 
-    if (models.length > 0 && providerID === "custom") {
-      cfg.provider = cfg.provider || {};
-      cfg.provider.custom = cfg.provider.custom || {
-        name: "Custom OpenAI-Compatible",
-        npm: "@ai-sdk/openai-compatible",
-        options: { baseURL: "{env:CUSTOM_BASE_URL}", apiKey: "{env:CUSTOM_API_KEY}" }
-      };
-      cfg.provider.custom.npm = "@ai-sdk/openai-compatible";
-      cfg.provider.custom.models = cfg.provider.custom.models || {};
+    if (models.length > 0 && (providerID === "glm" || providerID === "custom")) {
+      const block = ensureOpenAICompatibleProviderBlock(cfg, providerID);
       let changed = false;
       for (const m of models) {
-        if (!cfg.provider.custom.models[m.id]) {
-          cfg.provider.custom.models[m.id] = {
+        if (!block.models[m.id]) {
+          block.models[m.id] = {
             name: m.name || m.id,
             reasoning: true,
             tool_call: true
@@ -230,19 +277,13 @@ async function fetchLiveModelsFromEndpoint(providerID: "deepseek" | "openrouter"
   }
 }
 
-async function ensureProviderModelRegistered(providerID: string, modelID: string) {
+async function ensureProviderModelRegistered(providerID: ProviderID, modelID: string) {
   const cfg = readOpencodeConfig();
   cfg.provider = cfg.provider || {};
   cfg.provider[providerID] = cfg.provider[providerID] || { options: {} };
-  if (providerID === "custom") {
-    cfg.provider.custom.name = cfg.provider.custom.name || "Custom OpenAI-Compatible";
-    cfg.provider.custom.npm = "@ai-sdk/openai-compatible";
-    cfg.provider.custom.options = cfg.provider.custom.options || {
-      baseURL: "{env:CUSTOM_BASE_URL}",
-      apiKey: "{env:CUSTOM_API_KEY}"
-    };
-    cfg.provider.custom.models = cfg.provider.custom.models || {};
-    cfg.provider.custom.models[modelID] = {
+  if (providerID === "glm" || providerID === "custom") {
+    const block = ensureOpenAICompatibleProviderBlock(cfg, providerID);
+    block.models[modelID] = {
       name: modelID,
       reasoning: true,
       tool_call: true
@@ -268,12 +309,13 @@ function normalizeRole(raw: string): "main" | "scout" | null {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Hermes-Style Native Feishu Outbound Transport (reply + post/text + update + Typing reaction)
+// Hermes-Style Native Feishu Outbound Transport
 // ─────────────────────────────────────────────────────────────────────────────
 
 let activeLarkClient: Lark.Client | null = null;
 
-const MARKDOWN_SYNTAX_RE = /```|`[^`\n]+`|\*\*[^*\n]+\*\*|\[[^\]]+\]\(https?:\/\/[^)]+\)|^#{1,6}\s+|^\s*[-*]\s+|^\s*\d+\.\s+|^\s*>\s+/m;
+const MARKDOWN_SYNTAX_RE =
+  /```|`[^`\n]+`|\*\*[^*\n]+\*\*|\[[^\]]+\]\(https?:\/\/[^)]+\)|^#{1,6}\s+|^\s*[-*]\s+|^\s*\d+\.\s+|^\s*>\s+/m;
 
 function buildMarkdownPostPayload(content: string): string {
   const rows: Array<Array<{ tag: string; text: string }>> = [];
@@ -315,7 +357,11 @@ async function sendFeishuMessage(
   if (!activeLarkClient || !chatId.startsWith("oc_")) return undefined;
   const { msgType, payload } = buildOutboundPayload(text);
 
-  const attemptSend = async (type: "text" | "post", bodyContent: string, useReply: boolean): Promise<string | undefined> => {
+  const attemptSend = async (
+    type: "text" | "post",
+    bodyContent: string,
+    useReply: boolean
+  ): Promise<string | undefined> => {
     if (useReply && opts?.replyToMsgId) {
       const resp = await activeLarkClient!.im.v1.message.reply({
         path: { message_id: opts.replyToMsgId },
@@ -419,8 +465,6 @@ async function removeReaction(messageId: string, reactionId?: string): Promise<v
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Real-Time Session Activity & Main-Agent Tool Progress Engine (OpenCode SSE)
-// Note: Scout subagents run silently in the background; ONLY Main Agent tool
-// calls are streamed to chat, and Scouts ONLY display their final report!
 // ─────────────────────────────────────────────────────────────────────────────
 
 interface SessionLiveState {
@@ -499,8 +543,12 @@ const TOOL_EMOJIS: Record<string, string> = {
   webfetch: "🌐",
   websearch: "🔎",
   skill: "🧩",
+  load_skill: "📚",
   graph_overview: "📊",
-  add_intent: "🎯",
+  manage_insight: "💡",
+  delete_record: "🗑️",
+  search_history: "🏛️",
+  load_history: "📥",
   fork_scout: "🚀",
   stop_scout: "🛑",
   send_hint: "⚡",
@@ -540,12 +588,23 @@ export function formatToolProgressBubble(toolName: string, args: Record<string, 
     preview = oneLineTrunc(args.pattern || "");
   } else if (toolName === "webfetch" || toolName === "websearch") {
     preview = oneLineTrunc(args.url || args.query || "");
-  } else if (toolName === "skill") {
-    preview = oneLineTrunc(args.name || "");
-  } else if (toolName === "add_intent") {
-    preview = oneLineTrunc(args.title || args.detail || "");
+  } else if (toolName === "skill" || toolName === "load_skill") {
+    preview = oneLineTrunc(`${args.name || ""}${args.file_path ? `/${args.file_path}` : ""}`);
+  } else if (toolName === "manage_insight") {
+    const act = args.action || "add";
+    const idStr = args.insight_id ? `#${args.insight_id} ` : "";
+    preview = oneLineTrunc(`${act} ${idStr}${args.title || args.status || ""}`);
+  } else if (toolName === "delete_record") {
+    preview = `${args.record_type || ""} #${args.id || ""}`.trim();
+  } else if (toolName === "search_history") {
+    preview = oneLineTrunc(args.query || "all sessions");
+  } else if (toolName === "load_history") {
+    preview = oneLineTrunc(`${args.source_session_id || ""} ${args.query || ""}`.trim());
+  } else if (toolName === "graph_overview") {
+    preview = args.insight_id ? `Insight #${args.insight_id}` : "";
   } else if (toolName === "fork_scout") {
-    preview = oneLineTrunc(args.goal || "");
+    const insTag = args.insight_id ? `[Insight#${args.insight_id}] ` : "";
+    preview = oneLineTrunc(`${insTag}${args.goal || ""}`);
   } else if (toolName === "stop_scout") {
     preview = `${args.scout_id || ""} ${oneLineTrunc(args.reason || "", 40)}`.trim();
   } else if (toolName === "send_hint") {
@@ -566,12 +625,18 @@ export function formatToolProgressBubble(toolName: string, args: Record<string, 
   return preview ? `${emoji} ${toolName}  \`${preview.replace(/`/g, "'")}\`` : `${emoji} ${toolName}`;
 }
 
-async function emitMainToolProgressToFeishu(sessionId: string, st: SessionLiveState, toolName: string, args: Record<string, any>) {
-  // Never emit Scout tool calls into main Feishu chat; Scouts run silently until final report!
+async function emitMainToolProgressToFeishu(
+  sessionId: string,
+  st: SessionLiveState,
+  toolName: string,
+  args: Record<string, any>
+) {
   const scout = db.prepare(`SELECT 1 FROM scouts WHERE session_id = ?`).get(sessionId);
   if (scout) return;
 
-  const chatRow = db.prepare(`SELECT chat_id, last_user_msg_id FROM chat_bindings WHERE main_session_id = ?`).get(sessionId) as any;
+  const chatRow = db
+    .prepare(`SELECT chat_id, last_user_msg_id FROM chat_bindings WHERE main_session_id = ?`)
+    .get(sessionId) as any;
   if (!chatRow?.chat_id || !chatRow.chat_id.startsWith("oc_")) return;
 
   const replyToMsgId = activeMainTurnReplyMsgId.get(sessionId) || chatRow.last_user_msg_id || undefined;
@@ -645,7 +710,8 @@ function startOpencodeEventStream() {
                 st.activity = `running ${st.currentTool}`;
                 if (part.id && !st.seenToolPartIds.has(part.id)) {
                   st.seenToolPartIds.add(part.id);
-                  const inputArgs = (part.state?.input && typeof part.state.input === "object") ? part.state.input : {};
+                  const inputArgs =
+                    part.state?.input && typeof part.state.input === "object" ? part.state.input : {};
                   emitMainToolProgressToFeishu(sid, st, st.currentTool!, inputArgs).catch((err) =>
                     console.error("[Tool Progress Emit Error]:", err)
                   );
@@ -678,7 +744,6 @@ export function buildWorkingHeartbeatText(opts: {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Per-Main-Session Serializing Turn Queue & Main Agent Prompt Runner
-// Ensures user messages and Scout completion/timeout callbacks never collide!
 // ─────────────────────────────────────────────────────────────────────────────
 
 const mainTurnQueues = new Map<string, Promise<any>>();
@@ -694,12 +759,13 @@ function bumpSessionEpoch(mainSessionId: string): number {
   return next;
 }
 
-function enqueueMainAgentTurn<T>(mainSessionId: string, task: (epochAtEnqueue: number) => Promise<T>): Promise<T> {
+function enqueueMainAgentTurn<T>(
+  mainSessionId: string,
+  task: (epochAtEnqueue: number) => Promise<T>
+): Promise<T> {
   const epochAtEnqueue = getSessionEpoch(mainSessionId);
   const prev = mainTurnQueues.get(mainSessionId) || Promise.resolve();
-  const next = prev
-    .catch(() => {})
-    .then(() => task(epochAtEnqueue));
+  const next = prev.catch(() => {}).then(() => task(epochAtEnqueue));
   mainTurnQueues.set(mainSessionId, next);
   return next;
 }
@@ -814,18 +880,22 @@ async function executeMainAgentPrompt(opts: {
 async function getOrCreateMainSession(chatId: string, userMsgId?: string): Promise<string> {
   const row = db.prepare(`SELECT main_session_id FROM chat_bindings WHERE chat_id = ?`).get(chatId) as any;
   if (row?.main_session_id) {
+    ensureHuntingSession(row.main_session_id);
     if (userMsgId) {
-      db.prepare(`UPDATE chat_bindings SET last_user_msg_id = ?, updated_at = CURRENT_TIMESTAMP WHERE chat_id = ?`)
-        .run(userMsgId, chatId);
+      db.prepare(
+        `UPDATE chat_bindings SET last_user_msg_id = ?, updated_at = CURRENT_TIMESTAMP WHERE chat_id = ?`
+      ).run(userMsgId, chatId);
     }
     return row.main_session_id;
   }
+  const title = `Feishu Main Strategist (${chatId})`;
   const created = await opencode.session.create({
-    body: { title: `Feishu Main Strategist (${chatId})` }
+    body: { title }
   });
   if (!created.data?.id) {
     throw new Error(`Failed to create OpenCode session: ${JSON.stringify(created.error)}`);
   }
+  ensureHuntingSession(created.data.id, title);
   db.prepare(`
     INSERT OR REPLACE INTO chat_bindings (chat_id, main_session_id, last_user_msg_id, updated_at)
     VALUES (?, ?, ?, CURRENT_TIMESTAMP)
@@ -843,19 +913,26 @@ export async function handleIncomingText(
   const trimmed = text.trim();
   const mainSessionId = await getOrCreateMainSession(chatId, userMsgId);
 
-  // 1. Check if user replied to a Scout's Final Report bubble to inject a targeted Hint
   if (parentMsgId && !trimmed.startsWith("/")) {
-    const threadRow = db.prepare(`SELECT scout_id FROM thread_bindings WHERE thread_msg_id = ?`).get(parentMsgId) as any;
+    const threadRow = db
+      .prepare(`SELECT scout_id FROM thread_bindings WHERE thread_msg_id = ?`)
+      .get(parentMsgId) as any;
     if (threadRow?.scout_id) {
       const scout = db.prepare(`SELECT * FROM scouts WHERE scout_id = ?`).get(threadRow.scout_id) as any;
       if (scout) {
-        db.prepare(`INSERT INTO hints (main_session_id, target_scout_id, content, source) VALUES (?, ?, ?, 'feishu_thread')`)
-          .run(mainSessionId, scout.scout_id, trimmed);
+        db.prepare(
+          `INSERT INTO hints (main_session_id, target_scout_id, content, source) VALUES (?, ?, ?, 'feishu_thread')`
+        ).run(mainSessionId, scout.scout_id, trimmed);
         await opencode.session.prompt({
           path: { id: scout.session_id },
           body: {
             noReply: true,
-            parts: [{ type: "text", text: `⚡ [人类操作员通过飞书引用回复向 ${scout.scout_id} 定向注入 Hint]:\n${trimmed}` }]
+            parts: [
+              {
+                type: "text",
+                text: `⚡ [人类操作员通过飞书引用回复向 ${scout.scout_id} 定向注入 Hint]:\n${trimmed}`
+              }
+            ]
           }
         });
         const msg = `⚡ 已定向注入 Hint 到 **${scout.scout_id}** (不干扰其他分支):\n> ${trimmed}`;
@@ -865,7 +942,6 @@ export async function handleIncomingText(
     }
   }
 
-  // 2. Slash Commands (Execute immediately out-of-band without blocking on LLM queue!)
   if (trimmed === "/stop" || trimmed.startsWith("/stop ")) {
     const targetArg = trimmed.slice(5).trim();
 
@@ -877,10 +953,9 @@ export async function handleIncomingText(
         return msg;
       }
       await opencode.session.abort({ path: { id: scout.session_id } }).catch(() => {});
-      db.prepare(`UPDATE scouts SET status = 'stopped', callback_sent = 1, updated_at = CURRENT_TIMESTAMP WHERE scout_id = ?`).run(scout.scout_id);
-      if (scout.intent_id) {
-        db.prepare(`UPDATE intents SET status = 'stopped' WHERE id = ?`).run(scout.intent_id);
-      }
+      db.prepare(
+        `UPDATE scouts SET status = 'stopped', callback_sent = 1, updated_at = CURRENT_TIMESTAMP WHERE scout_id = ?`
+      ).run(scout.scout_id);
       const st = sessionStates.get(scout.session_id);
       if (st) {
         st.busy = false;
@@ -891,7 +966,6 @@ export async function handleIncomingText(
       return msg;
     }
 
-    // Default /stop or /stop all: abort Main Agent + all running Scouts in current session
     bumpSessionEpoch(mainSessionId);
     await opencode.session.abort({ path: { id: mainSessionId } }).catch(() => {});
     const mainSt = sessionStates.get(mainSessionId);
@@ -900,14 +974,15 @@ export async function handleIncomingText(
       mainSt.currentTool = null;
     }
 
-    const runningScouts = db.prepare(`SELECT * FROM scouts WHERE parent_session_id = ? AND status = 'running'`).all(mainSessionId) as any[];
+    const runningScouts = db
+      .prepare(`SELECT * FROM scouts WHERE parent_session_id = ? AND status = 'running'`)
+      .all(mainSessionId) as any[];
     const stoppedIds: string[] = [];
     for (const s of runningScouts) {
       await opencode.session.abort({ path: { id: s.session_id } }).catch(() => {});
-      db.prepare(`UPDATE scouts SET status = 'stopped', callback_sent = 1, updated_at = CURRENT_TIMESTAMP WHERE scout_id = ?`).run(s.scout_id);
-      if (s.intent_id) {
-        db.prepare(`UPDATE intents SET status = 'stopped' WHERE id = ?`).run(s.intent_id);
-      }
+      db.prepare(
+        `UPDATE scouts SET status = 'stopped', callback_sent = 1, updated_at = CURRENT_TIMESTAMP WHERE scout_id = ?`
+      ).run(s.scout_id);
       const st = sessionStates.get(s.session_id);
       if (st) {
         st.busy = false;
@@ -916,15 +991,15 @@ export async function handleIncomingText(
       stoppedIds.push(s.scout_id);
     }
 
-    const msg = stoppedIds.length > 0
-      ? `🛑 已终止主脑当前任务，并停止 ${stoppedIds.length} 个运行中的子分支 (\`${stoppedIds.join("`, `")}\`)。`
-      : `🛑 已终止主脑当前任务。`;
+    const msg =
+      stoppedIds.length > 0
+        ? `🛑 已终止主脑当前任务，并停止 ${stoppedIds.length} 个运行中的子分支 (\`${stoppedIds.join("`, `")}\`)。`
+        : `🛑 已终止主脑当前任务。`;
     if (sendReply) await sendReply(msg);
     return msg;
   }
 
   if (trimmed === "/new") {
-    // 1. Abort active Main Agent turn & any running Scouts before wiping state
     bumpSessionEpoch(mainSessionId);
     await opencode.session.abort({ path: { id: mainSessionId } }).catch(() => {});
     const allScouts = db.prepare(`SELECT session_id FROM scouts`).all() as any[];
@@ -937,25 +1012,36 @@ export async function handleIncomingText(
     sessionStates.delete(mainSessionId);
     mainTurnQueues.delete(mainSessionId);
 
-    // 2. Wipe all Scout workspaces on disk and reset SQLite blackboard + AUTOINCREMENT sequences
+    const prevOv = getGraphOverview(mainSessionId) as any;
     const cleanRes = cleanScoutWorkspaces({
       mainSessionId,
       all: true,
       includeRunning: true
     });
-    resetBlackboardForNewSession();
+    resetBlackboardForNewSession(mainSessionId);
 
-    // 3. Create fresh Strategist session
+    const newTitle = `Feishu Main Strategist (${chatId}) - ${new Date().toISOString()}`;
     const created = await opencode.session.create({
-      body: { title: `Feishu Main Strategist (${chatId}) - ${new Date().toISOString()}` }
+      body: { title: newTitle }
     });
     const newId = created.data!.id;
-    db.prepare(`INSERT OR REPLACE INTO chat_bindings (chat_id, main_session_id, last_user_msg_id, updated_at) VALUES (?, ?, ?, CURRENT_TIMESTAMP)`)
-      .run(chatId, newId, userMsgId || null);
-    const cleanedNote = cleanRes.cleaned_scouts.length > 0
-      ? `\n🧹 已自动清空 ${cleanRes.cleaned_scouts.length} 个历史 Scout 工作区 (${cleanRes.cleaned_scouts.join(", ")})，所有编号已重置从 1 开始。`
-      : `\n🧹 工作区与所有编号（Intent #1 / Scout-1）已重置就绪。`;
-    const msg = `🆕 已开启新会话 (\`${newId}\`) 与空白探索图黑板。${cleanedNote}`;
+    ensureHuntingSession(newId, newTitle);
+    db.prepare(
+      `INSERT OR REPLACE INTO chat_bindings (chat_id, main_session_id, last_user_msg_id, updated_at) VALUES (?, ?, ?, CURRENT_TIMESTAMP)`
+    ).run(chatId, newId, userMsgId || null);
+
+    const archiveStats = getHistoricalArchiveStats(newId);
+    const archivedNote =
+      prevOv.counts && (prevOv.counts.insights > 0 || prevOv.counts.findings > 0 || prevOv.counts.facts > 0)
+        ? `\n🏛️ 上一轮成果（${prevOv.counts.insights} Insights / ${prevOv.counts.findings} Findings / ${prevOv.counts.facts} Facts）已自动归档至历史库（全库累计 ${archiveStats.insights_count} Insights / ${archiveStats.findings_count} Findings），新会话提起目标时主脑可自动检索并加载。`
+        : archiveStats.insights_count > 0
+          ? `\n🏛️ 历史库共存有 ${archiveStats.sessions_count} 个归档会话（${archiveStats.insights_count} Insights / ${archiveStats.findings_count} Findings），主脑可随时通过 \`search_history\` / \`load_history\` 调取。`
+          : "";
+    const cleanedNote =
+      cleanRes.cleaned_scouts.length > 0
+        ? `\n🧹 已清空 ${cleanRes.cleaned_scouts.length} 个历史 Scout 工作区 (${cleanRes.cleaned_scouts.join(", ")})，本轮编号已从 1 开始。`
+        : `\n🧹 本轮工作区与编号（Insight #1 / Scout-1）已就绪。`;
+    const msg = `🆕 已开启新会话 (\`${newId}\`) 与空白探索图黑板。${archivedNote}${cleanedNote}`;
     if (sendReply) await sendReply(msg);
     return msg;
   }
@@ -969,42 +1055,70 @@ export async function handleIncomingText(
       all: isAll,
       includeRunning: false
     });
-    const cleanedLine = res.cleaned_scouts.length > 0
-      ? `✅ 已清空 ${res.cleaned_scouts.length} 个工作区: \`${res.cleaned_scouts.join("`, `")}\``
-      : `🧹 没有需要清理的工作区目录（已处于干净状态）`;
-    const skippedLine = res.skipped_running.length > 0
-      ? `\n⏳ 已跳过仍在运行中的子分支: \`${res.skipped_running.join("`, `")}\``
-      : "";
+    const cleanedLine =
+      res.cleaned_scouts.length > 0
+        ? `✅ 已清空 ${res.cleaned_scouts.length} 个工作区: \`${res.cleaned_scouts.join("`, `")}\``
+        : `🧹 没有需要清理的工作区目录（已处于干净状态）`;
+    const skippedLine =
+      res.skipped_running.length > 0
+        ? `\n⏳ 已跳过仍在运行中的子分支: \`${res.skipped_running.join("`, `")}\``
+        : "";
     const msg = `${cleanedLine}${skippedLine}`;
     if (sendReply) await sendReply(msg);
     return msg;
   }
 
   if (trimmed === "/status" || trimmed === "/graph" || trimmed === "/scouts") {
-    const ov = getGraphOverview(mainSessionId);
+    const ov = getGraphOverview(mainSessionId) as any;
+    const archiveStats = getHistoricalArchiveStats(mainSessionId);
     const mainCfg = getAgentModelConfig("main");
     const scoutCfg = getAgentModelConfig("scout");
-    const scoutLines = ov.scouts.length === 0
-      ? "  （暂无分叉出的 Scout）"
-      : ov.scouts.map((s: any) => {
-          const st = sessionStates.get(s.session_id);
-          const liveAct = s.status === "running" && st?.busy ? ` | ${st.activity}` : "";
-          const remainSec = s.status === "running" && s.deadline_at
-            ? ` | 剩余超时: \`${Math.max(0, Math.round((Number(s.deadline_at) - Date.now()) / 1000))}s\``
-            : "";
-          return `  - **${s.scout_id}** [${s.status}${liveAct}] 轮数: \`${s.steps_used}/${s.max_steps}\`${remainSec} | 模型: \`${s.model}\`\n    目标: ${s.goal.slice(0, 80)}\n    工作区: \`${s.workspace_dir}\`${s.report_summary ? `\n    摘要: ${s.report_summary}` : ""}`;
-        }).join("\n");
-    const factLines = ov.facts.slice(0, 8).map((f: any) => `  - [#${f.id} by ${f.scout_id}] ${f.summary}`).join("\n") || "  （暂无）";
-    const findingLines = ov.findings.map((f: any) => `  - 🔥 [#${f.id} ${f.severity.toUpperCase()}] **${f.title}** (${f.vuln_class}): ${f.summary}`).join("\n") || "  （暂无）";
+
+    const insightLines =
+      !ov.insight_tree || ov.insight_tree.length === 0
+        ? "  （当前会话暂无 Insight，与主脑讨论目标后建立或从历史库加载）"
+        : ov.insight_tree
+            .map(
+              (ins: any) =>
+                `  - 💡 **[#${ins.id} ${ins.status}]** ${ins.target ? `(\`${ins.target}\`) ` : ""}**${ins.title}** — Findings: \`${ins.findings.length}\` | Facts: \`${ins.facts.length}\``
+            )
+            .join("\n");
+
+    const scoutLines =
+      ov.scouts.length === 0
+        ? "  （暂无分叉出的 Scout）"
+        : ov.scouts
+            .map((s: any) => {
+              const st = sessionStates.get(s.session_id);
+              const liveAct = s.status === "running" && st?.busy ? ` | ${st.activity}` : "";
+              const remainSec =
+                s.status === "running" && s.deadline_at
+                  ? ` | 剩余超时: \`${Math.max(0, Math.round((Number(s.deadline_at) - Date.now()) / 1000))}s\``
+                  : "";
+              const insRef = s.insight_id ? ` -> Insight #${s.insight_id}` : "";
+              return `  - **${s.scout_id}**${insRef} [${s.status}${liveAct}] 轮数: \`${s.steps_used}/${s.max_steps}\`${remainSec} | 模型: \`${s.model}\`\n    目标: ${s.goal.slice(0, 80)}${s.report_summary ? `\n    摘要: ${s.report_summary}` : ""}`;
+            })
+            .join("\n");
+
+    const allFindings = ov.insight_tree ? ov.insight_tree.flatMap((ins: any) => ins.findings) : [];
+    const findingLines =
+      allFindings
+        .map(
+          (f: any) =>
+            `  - 🔥 [#${f.id} ${f.severity.toUpperCase()}] **${f.title}** (${f.vuln_class}): ${f.summary}`
+        )
+        .join("\n") || "  （暂无）";
+
     const msg =
       `📊 **紫电 (PurpleLight) · 实时状态总览**\n` +
       `- 主会话 ID: \`${mainSessionId}\`\n` +
       `- 🧠 **main**: \`${mainCfg.providerID}/${mainCfg.modelID}\`\n` +
       `- 🤖 **scout**: \`${scoutCfg.providerID}/${scoutCfg.modelID}\`\n` +
-      `- Intents: ${ov.intents.length} | Facts: ${ov.facts.length} | Findings: ${ov.findings.length} | Hints: ${ov.hints.length}\n\n` +
+      `- 本轮黑板: Insights \`${ov.counts.insights}\` | Facts \`${ov.counts.facts}\` | Findings \`${ov.counts.findings}\` | Scouts \`${ov.counts.scouts}\`\n` +
+      `- 🏛️ 历史库归档: \`${archiveStats.sessions_count}\` 个会话 | \`${archiveStats.insights_count}\` Insights | \`${archiveStats.findings_count}\` Findings | \`${archiveStats.facts_count}\` Facts\n\n` +
+      `💡 **Insights (情报与假设树)**:\n${insightLines}\n\n` +
       `🤖 **Scouts**:\n${scoutLines}\n\n` +
-      `📌 **最新 Facts**:\n${factLines}\n\n` +
-      `🏆 **确认 Findings**:\n${findingLines}`;
+      `🏆 **本轮 Findings**:\n${findingLines}`;
     if (sendReply) await sendReply(msg);
     return msg;
   }
@@ -1014,19 +1128,20 @@ export async function handleIncomingText(
     const cfg = readOpencodeConfig();
     const mainCfg = getAgentModelConfig("main");
     const scoutCfg = getAgentModelConfig("scout");
+    const provListText = SUPPORTED_PROVIDERS.map((p) => `\`${p}\``).join(" / ");
 
     if (args.length === 0) {
       const msg =
-        `**可用 Providers**: \`deepseek\` / \`openrouter\` / \`custom\`\n` +
-        `- 🧠 **main**: \`${mainCfg.providerID}\`\n` +
-        `- 🤖 **scout**: \`${scoutCfg.providerID}\`\n\n` +
-        `切换: \`/provider <main|scout> <deepseek|openrouter|custom>\`\n` +
-        `配置: \`/provider set <deepseek|openrouter> <api_key>\` 或 \`/provider set custom <base_url> <api_key>\``;
+        `**可用 Providers**: ${provListText}\n` +
+        `- 🧠 **main**: \`${mainCfg.providerID}\` (\`${mainCfg.modelID}\`)\n` +
+        `- 🤖 **scout**: \`${scoutCfg.providerID}\` (\`${scoutCfg.modelID}\`)\n\n` +
+        `切换: \`/provider <main|scout> <glm|deepseek|openrouter|custom> [可选模型名]\`\n` +
+        `配置: \`/provider set <glm|deepseek|openrouter> <api_key> [base_url]\` 或 \`/provider set custom <base_url> <api_key>\``;
       if (sendReply) await sendReply(msg);
       return msg;
     }
 
-    if (args[0].toLowerCase() === "set") {
+    if (args[0]!.toLowerCase() === "set") {
       const targetProv = (args[1] || "").toLowerCase();
       cfg.provider = cfg.provider || {};
 
@@ -1039,16 +1154,31 @@ export async function handleIncomingText(
           return msg;
         }
         const changedEnv = upsertEnvVars({ CUSTOM_BASE_URL: baseURL, CUSTOM_API_KEY: apiKey });
-        cfg.provider.custom = {
-          name: "Custom OpenAI-Compatible",
-          npm: "@ai-sdk/openai-compatible",
-          options: { baseURL: "{env:CUSTOM_BASE_URL}", apiKey: "{env:CUSTOM_API_KEY}" },
-          models: cfg.provider.custom?.models || {}
-        };
+        ensureOpenAICompatibleProviderBlock(cfg, "custom");
         await saveOpencodeConfigAndReload(cfg);
         const reloadNote = await reloadOpencodeAfterEnvChange(changedEnv);
         await fetchLiveModelsFromEndpoint("custom");
         const msg = `✅ 已配置 \`custom\` 端点 (\`${baseURL}\`)${reloadNote}`;
+        if (sendReply) await sendReply(msg);
+        return msg;
+      }
+
+      if (targetProv === "glm") {
+        const apiKey = args[2];
+        const baseURL = args[3];
+        if (!apiKey) {
+          const msg = `用法: \`/provider set glm <api_key> [base_url]\``;
+          if (sendReply) await sendReply(msg);
+          return msg;
+        }
+        const updates: Record<string, string> = { GLM_API_KEY: apiKey };
+        if (baseURL) updates.GLM_BASE_URL = baseURL;
+        const changedEnv = upsertEnvVars(updates);
+        ensureOpenAICompatibleProviderBlock(cfg, "glm");
+        await saveOpencodeConfigAndReload(cfg);
+        const reloadNote = await reloadOpencodeAfterEnvChange(changedEnv);
+        await fetchLiveModelsFromEndpoint("glm");
+        const msg = `✅ 已更新 \`glm\` 配置${reloadNote}`;
         if (sendReply) await sendReply(msg);
         return msg;
       }
@@ -1079,23 +1209,30 @@ export async function handleIncomingText(
         return msg;
       }
 
-      const msg = `❌ 仅支持: \`deepseek\` / \`openrouter\` / \`custom\``;
+      const msg = `❌ 仅支持: ${provListText}`;
       if (sendReply) await sendReply(msg);
       return msg;
     }
 
-    const role = normalizeRole(args[0]);
-    const providerID = (args[1] || "").toLowerCase();
-    if (!role || !["deepseek", "openrouter", "custom"].includes(providerID)) {
-      const msg = `用法: \`/provider <main|scout> <deepseek|openrouter|custom>\``;
+    const role = normalizeRole(args[0] || "");
+    const rawProv = (args[1] || "").toLowerCase();
+    if (!role || !isSupportedProvider(rawProv)) {
+      const msg = `用法: \`/provider <main|scout> <glm|deepseek|openrouter|custom> [可选模型名]\``;
       if (sendReply) await sendReply(msg);
       return msg;
     }
 
-    const live = await fetchLiveModelsFromEndpoint(providerID as "deepseek" | "openrouter" | "custom");
+    const providerID: ProviderID = rawProv;
+    const live = await fetchLiveModelsFromEndpoint(providerID);
     let newModelID = args[2] || "";
     if (!newModelID) {
-      newModelID = live.models[0]?.id || (role === "main" ? mainCfg.modelID : scoutCfg.modelID);
+      if (providerID === "glm" && live.models.some((m) => m.id === "glm-5.3")) {
+        newModelID = "glm-5.3";
+      } else {
+        newModelID =
+          live.models[0]?.id ||
+          (providerID === "glm" ? "glm-5.3" : role === "main" ? mainCfg.modelID : scoutCfg.modelID);
+      }
     }
 
     setAgentModelConfig(role, providerID, newModelID);
@@ -1114,7 +1251,7 @@ export async function handleIncomingText(
     const roleArg = args[0] ? normalizeRole(args[0]) : null;
     if (args.length === 0 || (!roleArg && args.length === 1)) {
       const keyword = (args[0] || "").toLowerCase();
-      const activeProvs = Array.from(new Set([mainCfg.providerID, scoutCfg.providerID])) as Array<"deepseek" | "openrouter" | "custom">;
+      const activeProvs = Array.from(new Set([mainCfg.providerID, scoutCfg.providerID]));
       const sections: string[] = [];
 
       for (const prov of activeProvs) {
@@ -1126,9 +1263,11 @@ export async function handleIncomingText(
         const filtered = keyword
           ? live.models.filter((m) => m.id.toLowerCase().includes(keyword))
           : live.models;
-        const listStr = filtered.slice(0, 40).map((m) =>
-          m.name && m.name !== m.id ? `\`${m.id}\` (${m.name})` : `\`${m.id}\``
-        ).join(", ") || "（无匹配模型）";
+        const listStr =
+          filtered
+            .slice(0, 40)
+            .map((m) => (m.name && m.name !== m.id ? `\`${m.id}\` (${m.name})` : `\`${m.id}\``))
+            .join(", ") || "（无匹配模型）";
         sections.push(
           `**当前生效 Provider \`${prov}\` 模型列表 (${filtered.length}${keyword ? `/${live.models.length}` : ""} 个)**:\n${listStr}${filtered.length > 40 ? `\n*(仅显示前 40 个，可用 \`/model <关键词>\` 过滤)*` : ""}`
         );
@@ -1145,15 +1284,16 @@ export async function handleIncomingText(
 
     if (roleArg && args.length === 1) {
       const targetCfg = roleArg === "main" ? mainCfg : scoutCfg;
-      const live = await fetchLiveModelsFromEndpoint(targetCfg.providerID as "deepseek" | "openrouter" | "custom");
+      const live = await fetchLiveModelsFromEndpoint(targetCfg.providerID);
       if (!live.ok) {
         const msg = `❌ 获取 \`${targetCfg.providerID}\` 模型列表失败: ${live.error}`;
         if (sendReply) await sendReply(msg);
         return msg;
       }
-      const listStr = live.models.slice(0, 50).map((m) =>
-        m.name && m.name !== m.id ? `\`${m.id}\` (${m.name})` : `\`${m.id}\``
-      ).join(", ");
+      const listStr = live.models
+        .slice(0, 50)
+        .map((m) => (m.name && m.name !== m.id ? `\`${m.id}\` (${m.name})` : `\`${m.id}\``))
+        .join(", ");
       const msg =
         `**${roleArg}** 当前: \`${targetCfg.providerID}/${targetCfg.modelID}\`\n` +
         `**\`${targetCfg.providerID}\` 可用模型 (${live.models.length} 个)**:\n${listStr}`;
@@ -1169,10 +1309,15 @@ export async function handleIncomingText(
     }
 
     const currentCfg = getAgentModelConfig(roleArg);
-    const providerID = currentCfg.providerID;
-    const modelID = rawTarget;
+    let providerID: ProviderID = currentCfg.providerID;
+    let modelID = rawTarget;
+    const slashIdx = rawTarget.indexOf("/");
+    if (slashIdx > 0 && isSupportedProvider(rawTarget.slice(0, slashIdx))) {
+      providerID = rawTarget.slice(0, slashIdx) as ProviderID;
+      modelID = rawTarget.slice(slashIdx + 1);
+    }
 
-    await fetchLiveModelsFromEndpoint(providerID as "deepseek" | "openrouter" | "custom");
+    await fetchLiveModelsFromEndpoint(providerID);
     setAgentModelConfig(roleArg, providerID, modelID);
     await ensureProviderModelRegistered(providerID, modelID);
 
@@ -1190,10 +1335,12 @@ export async function handleIncomingText(
       return msg;
     }
     let files: string[] = [];
-    try { files = readdirSync(scout.workspace_dir); } catch {}
+    try {
+      files = readdirSync(scout.workspace_dir);
+    } catch {}
     const msg =
       `📑 **${scout.scout_id} 完整详细报告**\n` +
-      `- 状态: \`${scout.status}\` | 轮数: \`${scout.steps_used}/${scout.max_steps}\` | 超时设置: \`${scout.timeout_sec}s\`\n` +
+      `- 归属 Insight: \`#${scout.insight_id || "-"}\` | 状态: \`${scout.status}\` | 轮数: \`${scout.steps_used}/${scout.max_steps}\` | 超时设置: \`${scout.timeout_sec}s\`\n` +
       `- 专属工作区: \`${scout.workspace_dir}\` (文件: ${files.join(", ") || "空"})\n` +
       `- 核心摘要: ${scout.report_summary || "（尚未结案）"}\n\n` +
       `---\n${scout.report_detail || "（子 Agent 尚未提交报告，可让主脑调用 get_scout_detail 查看其最后几轮工具调用入参）"}`;
@@ -1211,8 +1358,9 @@ export async function handleIncomingText(
       if (sendReply) await sendReply(msg);
       return msg;
     }
-    db.prepare(`INSERT INTO hints (main_session_id, target_scout_id, content, source) VALUES (?, ?, ?, 'human_unicast')`)
-      .run(mainSessionId, scout.scout_id, hintText);
+    db.prepare(
+      `INSERT INTO hints (main_session_id, target_scout_id, content, source) VALUES (?, ?, ?, 'human_unicast')`
+    ).run(mainSessionId, scout.scout_id, hintText);
     await opencode.session.prompt({
       path: { id: scout.session_id },
       body: {
@@ -1227,17 +1375,20 @@ export async function handleIncomingText(
 
   if (trimmed.startsWith("/broadcast ")) {
     const hintText = trimmed.slice(11).trim();
-    db.prepare(`INSERT INTO hints (main_session_id, target_scout_id, content, source) VALUES (?, NULL, ?, 'human_broadcast')`)
-      .run(mainSessionId, hintText);
+    db.prepare(
+      `INSERT INTO hints (main_session_id, target_scout_id, content, source) VALUES (?, NULL, ?, 'human_broadcast')`
+    ).run(mainSessionId, hintText);
     const scouts = db.prepare(`SELECT * FROM scouts WHERE parent_session_id = ?`).all(mainSessionId) as any[];
     for (const s of scouts) {
-      await opencode.session.prompt({
-        path: { id: s.session_id },
-        body: {
-          noReply: true,
-          parts: [{ type: "text", text: `🌐 [人类操作员全局广播 Hint]:\n${hintText}` }]
-        }
-      }).catch(() => {});
+      await opencode.session
+        .prompt({
+          path: { id: s.session_id },
+          body: {
+            noReply: true,
+            parts: [{ type: "text", text: `🌐 [人类操作员全局广播 Hint]:\n${hintText}` }]
+          }
+        })
+        .catch(() => {});
     }
     const msg = `🌐 已向全部 ${scouts.length} 个子分支全局广播 Hint:\n> ${hintText}`;
     if (sendReply) await sendReply(msg);
@@ -1270,17 +1421,21 @@ export async function handleIncomingText(
     if (userMsgId) {
       db.prepare(`UPDATE scouts SET feishu_thread_msg_id = ? WHERE scout_id = ?`).run(userMsgId, scout.scout_id);
     }
-    const [providerID, modelID] = (scout.model || "deepseek/deepseek-flash").split("/");
+    const idx = String(scout.model || "deepseek/deepseek-flash").indexOf("/");
+    const providerID = idx > 0 ? scout.model.slice(0, idx) : "deepseek";
+    const modelID = idx > 0 ? scout.model.slice(idx + 1) : scout.model || "deepseek-flash";
     await opencode.session.promptAsync({
       path: { id: scout.session_id },
       body: {
         agent: "scout",
         variant: "max",
         model: { providerID, modelID },
-        parts: [{
-          type: "text",
-          text: `🔋 [已为你追加 +${addTurns} 轮预算，新上限: ${newMax} 步，新超时窗口: ${timeoutSec}s]\n${extraInstr || "请基于已有上下文继续深入探索，完成后调用 submit_scout_report 汇报。"}`
-        }]
+        parts: [
+          {
+            type: "text",
+            text: `🔋 [已为你追加 +${addTurns} 轮预算，新上限: ${newMax} 步，新超时窗口: ${timeoutSec}s]\n${extraInstr || "请基于已有上下文继续深入探索，完成后调用 submit_scout_report 汇报。"}`
+          }
+        ]
       } as any
     });
     const msg = `🔋 已为 **${scout.scout_id}** 追加 **+${addTurns}** 轮上限（当前 \`${scout.steps_used}/${newMax}\`，超时窗口 \`${timeoutSec}s\`），子分支已在后台继续静默探索。`;
@@ -1298,8 +1453,9 @@ export async function handleIncomingText(
       return msg;
     }
     const newStatus = isApprove ? "approved" : "denied";
-    db.prepare(`UPDATE hook_approvals SET status = ?, decided_by = 'human', decided_at = CURRENT_TIMESTAMP WHERE id = ?`)
-      .run(newStatus, approvalId);
+    db.prepare(
+      `UPDATE hook_approvals SET status = ?, decided_by = 'human', decided_at = CURRENT_TIMESTAMP WHERE id = ?`
+    ).run(newStatus, approvalId);
     const msg = isApprove
       ? `✅ 已批准 Approval #${approvalId} (${row.scout_id} 修改 \`${row.target_path}\`)`
       : `🚫 已拒绝 Approval #${approvalId} (${row.scout_id} 修改 \`${row.target_path}\`)`;
@@ -1310,9 +1466,9 @@ export async function handleIncomingText(
   if (trimmed === "/help") {
     const msg =
       `⚡ **紫电 (PurpleLight) · 飞书快捷指令**\n\n` +
-      `- \`/status\` / \`/scouts\` : 查看模型状态、探索图黑板与所有 Scout 分支进度\n` +
+      `- \`/status\` / \`/scouts\` : 查看模型状态、Insights 推理树、历史库统计与所有 Scout 进度\n` +
       `- \`/stop [scout-id|all]\` : 立即停止主脑当前工作（及运行中的 Scout），或指定停止某个 \`scout-N\`\n` +
-      `- \`/provider\` : 查看或切换 \`main\` / \`scout\` 的 Provider (\`deepseek\` / \`openrouter\` / \`custom\`)\n` +
+      `- \`/provider\` : 查看或切换 \`main\` / \`scout\` 的 Provider (\`glm\` / \`deepseek\` / \`openrouter\` / \`custom\`)\n` +
       `- \`/model\` : 实时抓取并查看/切换当前生效 Provider 的模型列表\n` +
       `- \`/report <scout-id>\` : 查看指定子分支的完整结案报告\n` +
       `- \`/hint <scout-id> <内容>\` : 向单个子分支发送定向单播 Hint（也可直接引用回复该分支的最终汇报）\n` +
@@ -1320,12 +1476,11 @@ export async function handleIncomingText(
       `- \`/extend <scout-id> <轮数> [秒数] [指令]\` : 为指定子分支动态追加轮数/超时上限并唤醒\n` +
       `- \`/clean [scout-id|all]\` : 清空指定或全部已完成 Scout 的工作区目录\n` +
       `- \`/approve <id>\` / \`/deny <id>\` : 审批子分支修改工作区外文件的请求\n` +
-      `- \`/new\` : 开启全新的主脑会话、重置所有编号并自动清空历史工作区`;
+      `- \`/new\` : 将本轮 Insights/Findings/Facts 归档入库，开启全新会话并清空临时工作区`;
     if (sendReply) await sendReply(msg);
     return msg;
   }
 
-  // 3. Normal Conversation -> Enqueue on Main Session Serializing Turn Queue
   return await enqueueMainAgentTurn(mainSessionId, (epochAtEnqueue) =>
     executeMainAgentPrompt({
       chatId,
@@ -1339,28 +1494,25 @@ export async function handleIncomingText(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Scout Lifecycle Watchdog (Timeout & Unreported Exhaustion Detection)
+// Scout Lifecycle Watchdog
 // ─────────────────────────────────────────────────────────────────────────────
 
 function startScoutLifecycleWatchdog() {
   setInterval(async () => {
     const now = Date.now();
-    const activeScouts = db.prepare(`
+    const activeScouts = db
+      .prepare(`
       SELECT * FROM scouts WHERE callback_sent = 0 AND status IN ('running', 'exhausted')
-    `).all() as any[];
+    `)
+      .all() as any[];
 
     for (const s of activeScouts) {
-      // 1. Check wall-clock timeout on running Scouts
       if (s.status === "running" && s.deadline_at && now > Number(s.deadline_at)) {
         db.prepare(`
           UPDATE scouts
           SET status = 'timeout', callback_sent = 1, report_summary = COALESCE(NULLIF(report_summary, ''), '执行超时被系统 Watchdog 自动中断'), updated_at = CURRENT_TIMESTAMP
           WHERE scout_id = ?
         `).run(s.scout_id);
-
-        if (s.intent_id) {
-          db.prepare(`UPDATE intents SET status = 'timeout' WHERE id = ?`).run(s.intent_id);
-        }
 
         await opencode.session.abort({ path: { id: s.session_id } }).catch(() => {});
         const st = sessionStates.get(s.session_id);
@@ -1371,6 +1523,7 @@ function startScoutLifecycleWatchdog() {
 
         pushOutboxEvent(s.parent_session_id, s.scout_id, "scout_abnormal_exit", {
           scout_id: s.scout_id,
+          insight_id: s.insight_id,
           reason: "timeout",
           goal: s.goal,
           steps_used: s.steps_used,
@@ -1380,11 +1533,11 @@ function startScoutLifecycleWatchdog() {
         continue;
       }
 
-      // 2. Check if an exhausted Scout stopped running without calling submit_scout_report
       if (s.status === "exhausted") {
         const st = sessionStates.get(s.session_id);
         const updatedMs = s.updated_at ? new Date(s.updated_at + "Z").getTime() : 0;
-        const idleLongEnough = (!st?.busy && now - (st?.lastEventAt || 0) > 8_000) || (updatedMs > 0 && now - updatedMs > 15_000);
+        const idleLongEnough =
+          (!st?.busy && now - (st?.lastEventAt || 0) > 8_000) || (updatedMs > 0 && now - updatedMs > 15_000);
         if (idleLongEnough) {
           db.prepare(`
             UPDATE scouts
@@ -1395,6 +1548,7 @@ function startScoutLifecycleWatchdog() {
           await opencode.session.abort({ path: { id: s.session_id } }).catch(() => {});
           pushOutboxEvent(s.parent_session_id, s.scout_id, "scout_abnormal_exit", {
             scout_id: s.scout_id,
+            insight_id: s.insight_id,
             reason: "exhausted",
             goal: s.goal,
             steps_used: s.steps_used,
@@ -1408,18 +1562,22 @@ function startScoutLifecycleWatchdog() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Background Outbox Poller -> Delivers Scout Final Report & Wakes Main Agent via Callback!
+// Background Outbox Poller -> Delivers Scout Final Report & Wakes Main Agent
 // ─────────────────────────────────────────────────────────────────────────────
 
 function startOutboxPoller() {
   setInterval(async () => {
-    const events = db.prepare(`SELECT * FROM events_outbox WHERE delivered = 0 ORDER BY id ASC LIMIT 20`).all() as any[];
+    const events = db
+      .prepare(`SELECT * FROM events_outbox WHERE delivered = 0 ORDER BY id ASC LIMIT 20`)
+      .all() as any[];
     for (const ev of events) {
       if (!ev.main_session_id) {
         db.prepare(`UPDATE events_outbox SET delivered = 1 WHERE id = ?`).run(ev.id);
         continue;
       }
-      const chatRow = db.prepare(`SELECT chat_id, last_user_msg_id FROM chat_bindings WHERE main_session_id = ?`).get(ev.main_session_id) as any;
+      const chatRow = db
+        .prepare(`SELECT chat_id, last_user_msg_id FROM chat_bindings WHERE main_session_id = ?`)
+        .get(ev.main_session_id) as any;
       if (!chatRow?.chat_id) {
         db.prepare(`UPDATE events_outbox SET delivered = 1 WHERE id = ?`).run(ev.id);
         continue;
@@ -1428,37 +1586,47 @@ function startOutboxPoller() {
 
       const chatId = chatRow.chat_id;
       const p = JSON.parse(ev.payload_json || "{}");
-      const scoutRow = p.scout_id ? (db.prepare(`SELECT feishu_thread_msg_id FROM scouts WHERE scout_id = ?`).get(p.scout_id) as any) : null;
+      const scoutRow = p.scout_id
+        ? (db.prepare(`SELECT feishu_thread_msg_id FROM scouts WHERE scout_id = ?`).get(p.scout_id) as any)
+        : null;
       const replyAnchor = scoutRow?.feishu_thread_msg_id || chatRow.last_user_msg_id || undefined;
+      const insTag = p.insight_id ? ` · Insight #${p.insight_id}` : "";
 
       if (ev.event_type === "scout_report_submitted") {
-        const preview = p.detail.length > 2500
-          ? p.detail.slice(0, 2500) + `\n\n...(全文共 ${p.detail.length} 字，可发 \`/report ${p.scout_id}\` 查看全文)`
-          : p.detail;
+        const preview =
+          p.detail.length > 2500
+            ? p.detail.slice(0, 2500) + `\n\n...(全文共 ${p.detail.length} 字，可发 \`/report ${p.scout_id}\` 查看全文)`
+            : p.detail;
         const reportMsg =
-          `✅ **[${p.scout_id} 最终汇报]** (轮数: \`${p.steps_used}/${p.max_steps}\` | 状态: \`${p.status}\`)\n` +
+          `✅ **[${p.scout_id}${insTag} 最终汇报]** (轮数: \`${p.steps_used}/${p.max_steps}\` | 状态: \`${p.status}\`)\n` +
           `- **核心摘要**: ${p.summary}\n` +
-          (p.suggest_more_turns ? `- ⚠️ **申请追加轮数**: 是 (${p.suggested_next_steps || "可调用 extend_scout 继续探索"})\n` : "") +
+          (p.suggest_more_turns
+            ? `- ⚠️ **申请追加轮数**: 是 (${p.suggested_next_steps || "可调用 extend_scout 继续探索"})\n`
+            : "") +
           `\n---\n${preview}`;
 
         let sentReportMsgId: string | undefined;
         if (activeLarkClient && chatId.startsWith("oc_")) {
           sentReportMsgId = await sendFeishuMessage(chatId, reportMsg, { replyToMsgId: replyAnchor });
           if (sentReportMsgId && p.scout_id) {
-            db.prepare(`INSERT OR REPLACE INTO thread_bindings (thread_msg_id, scout_id, chat_id) VALUES (?, ?, ?)`)
-              .run(sentReportMsgId, p.scout_id, chatId);
+            db.prepare(`INSERT OR REPLACE INTO thread_bindings (thread_msg_id, scout_id, chat_id) VALUES (?, ?, ?)`).run(
+              sentReportMsgId,
+              p.scout_id,
+              chatId
+            );
           }
         }
 
-        // Wake / activate Main Agent automatically via serialized callback turn!
         const callbackPrompt =
-          `🔔 [系统自动回调激活 — 子分支 ${p.scout_id} 已完成并提交最终汇报]\n` +
+          `🔔 [系统自动回调激活 — 子分支 ${p.scout_id}${insTag} 已完成并提交最终汇报]\n` +
           `- 状态: ${p.status} | 消耗轮数: ${p.steps_used}/${p.max_steps}\n` +
           `- 原始任务: ${p.goal || ""}\n` +
           `- 核心摘要: ${p.summary}\n` +
-          (p.suggest_more_turns ? `- ⚠️ 子分支申请追加轮数: 是 (建议下一步: ${p.suggested_next_steps || "继续深入"})\n` : "") +
+          (p.suggest_more_turns
+            ? `- ⚠️ 子分支申请追加轮数: 是 (建议下一步: ${p.suggested_next_steps || "继续深入"})\n`
+            : "") +
           `- 完整报告正文:\n${p.detail}\n\n` +
-          `请审阅上述子分支汇报，决定下一步编排动作（如需要可继续调用 extend_scout、fork_scout、record_fact 等），或直接向用户给出你的分析总结与下一步建议。`;
+          `请审阅上述子分支汇报，及时调用 \`manage_insight(action="update", insight_id=${p.insight_id || 1}, ...)\` 更新对应假设状态（如证伪则标为 falsified、实锤则标为 confirmed），并决定下一步编排动作或直接向用户汇报分析结论。`;
 
         const anchorForMain = sentReportMsgId || replyAnchor;
         enqueueMainAgentTurn(ev.main_session_id, (epochAtEnqueue) =>
@@ -1481,12 +1649,12 @@ function startOutboxPoller() {
 
         let sentAlertId: string | undefined;
         if (activeLarkClient && chatId.startsWith("oc_")) {
-          const alertMsg = `⚠️ **[${p.scout_id} 异常退出通知]** 原因: ${reasonLabel}（正在自动唤醒主脑诊断原因...）`;
+          const alertMsg = `⚠️ **[${p.scout_id}${insTag} 异常退出通知]** 原因: ${reasonLabel}（正在自动唤醒主脑诊断原因...）`;
           sentAlertId = await sendFeishuMessage(chatId, alertMsg, { replyToMsgId: replyAnchor });
         }
 
         const callbackPrompt =
-          `⚠️ [系统自动回调激活 — 子分支 ${p.scout_id} 异常退出 (${p.reason})]\n` +
+          `⚠️ [系统自动回调激活 — 子分支 ${p.scout_id}${insTag} 异常退出 (${p.reason})]\n` +
           `- 退出原因: ${reasonLabel}\n` +
           `- 已执行轮数: ${p.steps_used}/${p.max_steps} | 超时设置: ${p.timeout_sec}s\n` +
           `- 原始任务: ${p.goal || ""}\n\n` +
@@ -1533,7 +1701,6 @@ function claimMessageId(msgId: string, chatId: string): boolean {
 }
 
 function redactSensitiveLogText(text: string): string {
-  // Never persist raw API keys from /provider set commands into journald.
   if (!/^\/provider\s+set\s+/i.test(text)) return text;
   const parts = text.trim().split(/\s+/);
   if (parts.length < 4) return text;
@@ -1576,7 +1743,9 @@ async function processFeishuMsgItem(
   }
   if (!text) return;
 
-  console.log(`[Feishu WS Incoming] msg=${msgId} chat=${chatId} parent=${parentId || "none"}: ${redactSensitiveLogText(text)}`);
+  console.log(
+    `[Feishu WS Incoming] msg=${msgId} chat=${chatId} parent=${parentId || "none"}: ${redactSensitiveLogText(text)}`
+  );
 
   const reactionId = await addTypingReaction(msgId);
   try {
