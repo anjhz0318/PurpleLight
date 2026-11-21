@@ -612,7 +612,7 @@ export function formatToolProgressBubble(toolName: string, args: Record<string, 
   } else if (toolName === "broadcast_hint") {
     preview = oneLineTrunc(args.hint || "");
   } else if (toolName === "extend_scout") {
-    preview = `${args.scout_id || ""} (+${args.add_turns || 40})`;
+    preview = `${args.scout_id || ""} (+${args.add_turns ?? 40})`;
   } else if (toolName === "get_scout_detail") {
     preview = oneLineTrunc(args.scout_id || "");
   } else if (toolName === "clean_workspaces") {
