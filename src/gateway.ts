@@ -1740,6 +1740,35 @@ async function processFeishuMsgItem(
       }
       text = chunks.join("\n").replace(/@_user_\d+/g, "").trim();
     } catch {}
+  } else if (msgType === "file" || msgType === "media" || msgType === "image") {
+    try {
+      const parsed = JSON.parse(rawContent || "{}");
+      const fileKey = parsed.file_key || parsed.image_key;
+      const rawName = parsed.file_name || (msgType === "image" ? `${fileKey}.png` : `${fileKey}.bin`);
+      const safeName = String(rawName).replace(/[^a-zA-Z0-9._-]/g, "_");
+      if (fileKey && activeLarkClient) {
+        const uploadDir = join(PROJECT_ROOT, "workspaces", "uploads");
+        mkdirSync(uploadDir, { recursive: true });
+        const destPath = join(uploadDir, `${Date.now()}_${safeName}`);
+        const res: any = await activeLarkClient.im.v1.messageResource.get({
+          params: { type: msgType === "image" ? "image" : "file" },
+          path: { message_id: msgId, file_key: fileKey }
+        });
+        if (res && typeof res.writeFile === "function") {
+          await res.writeFile(destPath);
+        } else if (res && typeof res.getReadableStream === "function") {
+          const stream = res.getReadableStream();
+          const chunks: Buffer[] = [];
+          for await (const chunk of stream) {
+            chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+          }
+          writeFileSync(destPath, Buffer.concat(chunks));
+        }
+        text = `[用户通过飞书上传了文件: ${destPath} (原文件名: ${rawName})]`;
+      }
+    } catch (err: any) {
+      console.error("[Feishu File Download Error]:", err?.message || err);
+    }
   }
   if (!text) return;
 
